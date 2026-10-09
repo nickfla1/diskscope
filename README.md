@@ -10,7 +10,7 @@ Scan a drive or folder, see where the space went as a cushion-shaded treemap, fi
 - **Treemap.** Squarified layout with cushion shading, rendered once on a background thread into a texture, with an id buffer so hover and click are O(1) however many files are on screen. Color by file type, by application, or by cleanup risk.
 - **Applications.** Folders are attributed to applications through the installed-programs registry, Program Files, ProgramData, AppData, Steam/Epic game libraries and user folders.
 - **Large clusters.** The non-overlapping set of folders (or loose-file groups) where space actually concentrates, with an adjustable threshold.
-- **Cleanup suggestions.** Rule-based, graded **Safe / Review / Caution**: build output (`target`, `node_modules`, `bin`/`obj`), caches, temp files, crash dumps, old installers, large untouched files. Filter by risk, size and file type.
+- **Cleanup suggestions.** Rule-based, graded **Safe / Review / Caution**: build output (`target`, `node_modules`, `bin`/`obj`), caches, temp files, crash dumps, old installers, large untouched files, and **uninstall leftovers** (Program Files folders with no program in them, data of Store apps that are no longer installed). Filter by risk, size, file type and leftovers.
 - **Duplicates.** Size, then a 64 KiB prefix hash, then a full BLAKE3 hash, all in parallel.
 - **Types, large files, folder tree**, breadcrumb zoom, and a context menu (show in Explorer, copy path, delete).
 

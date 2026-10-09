@@ -12,6 +12,8 @@ mod treemap;
 mod tests;
 #[cfg(test)]
 mod tests_scanner;
+#[cfg(test)]
+mod tests_leftovers;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -80,6 +82,16 @@ async fn cli(path: PathBuf, on_disk: bool) {
     println!("\n== cleanup suggestions: {} (safe: {}) ==", a.suggestions.len(), fmt_size(safe));
     for s in a.suggestions.iter().take(15) {
         println!("{:>12} {:<7} {} -- {}", fmt_size(s.size), s.risk.label(), tree.path(s.node), s.reason);
+    }
+
+    let left: Vec<_> = a.suggestions.iter().filter(|s| s.leftover).collect();
+    println!(
+        "\n== uninstall leftovers: {} ({}) ==",
+        left.len(),
+        fmt_size(left.iter().map(|s| s.size).sum())
+    );
+    for s in left.iter().take(15) {
+        println!("{:>12} {}  -- {}", fmt_size(s.size), tree.path(s.node), s.reason);
     }
 
     // Exercise the renderer too.

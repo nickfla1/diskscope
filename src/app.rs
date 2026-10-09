@@ -166,7 +166,9 @@ pub struct App {
     // cleanup
     cleanup_min_mb: f64,
     show_risk: [bool; 3],
-    cleanup_key: Option<(u64, u64, [bool; 3], u32)>,
+    /// 0 = all suggestions, 1 = only uninstall leftovers, 2 = hide uninstall leftovers
+    leftover_filter: u8,
+    cleanup_key: Option<(u64, u64, [bool; 3], u32, u8)>,
     cleanup_view: Vec<usize>,
     checked: HashSet<u32>,
     pending_trash: Option<deletion::Plan>,
@@ -288,6 +290,7 @@ impl App {
             clusters: Vec::new(),
             cleanup_min_mb: 1.0,
             show_risk: [true, true, true],
+            leftover_filter: 0,
             cleanup_key: None,
             cleanup_view: Vec::new(),
             checked: HashSet::new(),
@@ -927,6 +930,16 @@ impl App {
             for (i, r) in [Risk::Safe, Risk::Review, Risk::Caution].into_iter().enumerate() {
                 ui.checkbox(&mut self.show_risk[i], egui::RichText::new(r.label()).color(risk_color(r)));
             }
+            ui.separator();
+            egui::ComboBox::from_id_salt("leftovers")
+                .selected_text(["All suggestions", "Only uninstall leftovers", "Hide uninstall leftovers"][self.leftover_filter as usize])
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.leftover_filter, 0, "All suggestions");
+                    ui.selectable_value(&mut self.leftover_filter, 1, "Only uninstall leftovers");
+                    ui.selectable_value(&mut self.leftover_filter, 2, "Hide uninstall leftovers");
+                })
+                .response
+                .on_hover_text("Folders left behind by uninstalled programs: Program Files folders with no program in them, and data of Store apps that are no longer installed.");
         });
         ui.horizontal_wrapped(|ui| {
             ui.label("Types:");
@@ -941,14 +954,14 @@ impl App {
                 self.show_cat = u32::MAX;
             }
         });
-        let key = (self.epoch, (self.cleanup_min_mb * 1024.0) as u64, self.show_risk, self.show_cat);
+        let key = (self.epoch, (self.cleanup_min_mb * 1024.0) as u64, self.show_risk, self.show_cat, self.leftover_filter);
         if self.cleanup_key != Some(key) {
             let min = (self.cleanup_min_mb * 1048576.0) as u64;
             self.cleanup_view = an
                 .suggestions
                 .iter()
                 .enumerate()
-                .filter(|(_, s)| s.size >= min && self.show_risk[s.risk as usize - 1] && self.show_cat >> t.node(s.node).cat & 1 == 1 && !t.is_gone(s.node))
+                .filter(|(_, s)| s.size >= min && (self.leftover_filter == 0 || (self.leftover_filter == 1) == s.leftover) && self.show_risk[s.risk as usize - 1] && self.show_cat >> t.node(s.node).cat & 1 == 1 && !t.is_gone(s.node))
                 .map(|(i, _)| i)
                 .collect();
             self.cleanup_key = Some(key);

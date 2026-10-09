@@ -36,6 +36,8 @@ pub struct Suggestion {
     pub size: u64,
     pub risk: Risk,
     pub reason: &'static str,
+    /// Left behind by an uninstalled program (shown under its own filter in the UI).
+    pub leftover: bool,
 }
 
 const DAY: u32 = 86_400;
@@ -169,6 +171,101 @@ fn classify_file(tree: &Tree, id: u32, name: &str, size: u64, mtime: u32, now: u
 
 /// Returns the (de-duplicated) suggestions and a per-node risk map for the treemap.
 pub fn detect(tree: &Tree) -> (Vec<Suggestion>, Vec<u8>) {
+    detect_with(tree, &crate::apps::installed(tree))
+}
+
+// ---------------------------------------------------------------- uninstall leftovers
+
+/// Extensions that mean "a program lives here".
+const BINARY_EXTS: [&str; 8] = ["exe", "dll", "sys", "ocx", "msi", "scr", "cpl", "jar"];
+
+/// Program Files children that are shared tooling or OS-owned (config-only, no binaries of their own);
+/// never judged. `Windows*` and `Microsoft*` folders are skipped by prefix as well.
+const PF_SKIP: [&str; 10] = [
+    "common files",
+    "windowsapps",
+    "modifiablewindowsapps",
+    "msbuild",
+    "nuget",
+    "vulkanrt",
+    "dotnet",
+    "reference assemblies",
+    "internet explorer",
+    "windowspowershell",
+];
+
+fn has_binary(tree: &Tree, root: u32) -> bool {
+    let mut stack = vec![root];
+    while let Some(d) = stack.pop() {
+        for c in tree.live_children(d) {
+            let n = tree.node(c);
+            if n.is_dir() {
+                stack.push(c);
+            } else if ext_in(tree.name(c), &BINARY_EXTS) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// `Name_<13 chars of a-z0-9>`: the shape of a Store package family folder. Browser sandbox containers
+/// (`cr.sb.*`, `fx.sb.*`) and similar are not packages and must not be judged.
+fn looks_like_package_family(name: &str) -> bool {
+    match name.split_once('_') {
+        Some((n, publisher)) => {
+            !n.is_empty()
+                && publisher.len() == 13
+                && publisher.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+                && !n.contains('_')
+        }
+        None => false,
+    }
+}
+
+/// Folders that look like remains of uninstalled programs:
+///   * a `Program Files` folder that is not any registered program's install location and holds no
+///     executables or libraries at all (only data is left);
+///   * a Store-package data folder in the current user's `%LOCALAPPDATA%Packages` whose package is no
+///     longer installed.
+/// Always graded Review: the signal is a heuristic.
+pub fn leftovers(tree: &Tree, inst: &crate::apps::Installed) -> Vec<Suggestion> {
+    let mut out = Vec::new();
+    let mut consider = |c: u32, reason: &'static str| {
+        let n = tree.node(c);
+        if n.is_dir() && !n.is_deleted() && n.size > 0 {
+            out.push(Suggestion { node: c, size: n.size, risk: Risk::Review, reason, leftover: true });
+        }
+    };
+
+    for pf in ["Program Files", "Program Files (x86)"] {
+        let Some(pfn) = tree.child_named(0, pf) else { continue };
+        for c in tree.live_children(pfn) {
+            let lc = tree.name(c).to_ascii_lowercase();
+            if PF_SKIP.contains(&lc.as_str()) || lc.starts_with("windows") || lc.starts_with("microsoft") || inst.nodes.contains(&c) {
+                continue;
+            }
+            if tree.node(c).is_dir() && !has_binary(tree, c) {
+                consider(c, "Program Files folder with no installed program and no executables - uninstall leftovers");
+            }
+        }
+    }
+
+    if let (Some(dir), Some(fams)) = (&inst.user_packages_dir, &inst.package_families) {
+        if let Some(pn) = tree.find(dir) {
+            for c in tree.live_children(pn) {
+                let name = tree.name(c);
+                if looks_like_package_family(name) && !fams.contains(&name.to_lowercase()) {
+                    consider(c, "Data of a Store app that is no longer installed");
+                }
+            }
+        }
+    }
+    out
+}
+
+/// [`detect`] with an explicit view of what is installed (tests pass a fake).
+pub fn detect_with(tree: &Tree, inst: &crate::apps::Installed) -> (Vec<Suggestion>, Vec<u8>) {
     let now = now_unix();
     let n = tree.nodes.len();
 
@@ -188,9 +285,11 @@ pub fn detect(tree: &Tree) -> (Vec<Suggestion>, Vec<u8>) {
                 }
                 classify_file(tree, id, name, nd.size, nd.mtime, now)?
             };
-            Some(Suggestion { node: id, size: nd.size, risk, reason })
+            Some(Suggestion { node: id, size: nd.size, risk, reason, leftover: false })
         })
         .collect();
+
+    found.extend(leftovers(tree, inst));
 
     // Drop anything nested inside another suggestion (e.g. the target dir inside node_modules).
     let ids: HashSet<u32> = found.iter().map(|s| s.node).collect();

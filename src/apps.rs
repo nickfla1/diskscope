@@ -163,6 +163,57 @@ fn registry_apps() -> Vec<(String, String, String)> {
     Vec::new()
 }
 
+/// What the registry says is installed right now. Used to tell live installs from uninstall leftovers.
+#[derive(Default)]
+pub struct Installed {
+    /// Nodes that are the `InstallLocation` of a registered program.
+    pub nodes: std::collections::HashSet<u32>,
+    /// Lower-cased Store package family names (`Name_<publisherid>`) known to Windows; `None` if the
+    /// registry could not be read (then no Store-package rule may fire).
+    pub package_families: Option<std::collections::HashSet<String>>,
+    /// The *current user's* `%LOCALAPPDATA%\Packages`. Other users' packages are never judged, because
+    /// their installed-package lists live in registry hives that are not loaded.
+    pub user_packages_dir: Option<String>,
+}
+
+#[cfg(windows)]
+fn package_families() -> Option<std::collections::HashSet<String>> {
+    use winreg::RegKey;
+    use winreg::enums::*;
+    const SUB: &str = r"Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages";
+    let mut set = std::collections::HashSet::new();
+    for (hive, path) in [
+        (HKEY_CURRENT_USER, format!(r"Software\Classes\{SUB}")),
+        (HKEY_LOCAL_MACHINE, format!(r"SOFTWARE\Classes\{SUB}")),
+    ] {
+        let Ok(key) = RegKey::predef(hive).open_subkey_with_flags(path, KEY_READ) else { continue };
+        for sub in key.enum_keys().flatten() {
+            // full name: Name_Version_Arch_ResourceId_PublisherId  ->  family: Name_PublisherId
+            let parts: Vec<&str> = sub.split('_').collect();
+            if parts.len() >= 2 {
+                set.insert(format!("{}_{}", parts[0], parts[parts.len() - 1]).to_lowercase());
+            }
+        }
+    }
+    (!set.is_empty()).then_some(set)
+}
+#[cfg(not(windows))]
+fn package_families() -> Option<std::collections::HashSet<String>> {
+    None
+}
+
+pub fn installed(tree: &Tree) -> Installed {
+    let mut inst = Installed::default();
+    for (_, loc, _) in registry_apps() {
+        if let Some(node) = tree.find(&loc) {
+            inst.nodes.insert(node);
+        }
+    }
+    inst.package_families = package_families();
+    inst.user_packages_dir = std::env::var("LOCALAPPDATA").ok().map(|p| format!("{}\\Packages", p.trim_end_matches('\\')));
+    inst
+}
+
 pub fn detect(tree: &Tree) -> (Vec<AppInfo>, Vec<u16>) {
     let mut b = Builder { tree, apps: Vec::new(), by_name: HashMap::new(), roots: HashMap::new() };
     let n = tree.nodes.len();
