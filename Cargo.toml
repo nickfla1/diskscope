@@ -1,0 +1,24 @@
+[package]
+name = "diskscope"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+blake3 = "1.8.7"
+eframe = "0.36.2"
+png = "0.18.1"
+rayon = "1.12.0"
+rfd = "0.17.2"
+sysinfo = "0.39.6"
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "sync", "time", "macros"] }
+trash = "5.2.9"
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Security", "Win32_System_IO", "Win32_System_Console"] }
+winreg = "0.56.0"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4

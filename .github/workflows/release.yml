@@ -1,0 +1,96 @@
+name: Build and release
+
+# Manual only: Actions tab -> "Build and release" -> Run workflow.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag, e.g. v0.1.0 (must not exist yet if you publish a release)"
+        required: true
+        type: string
+      publish:
+        description: "Publish a GitHub Release (otherwise only upload the build as a workflow artifact)"
+        required: true
+        default: true
+        type: boolean
+      prerelease:
+        description: "Mark the release as a pre-release"
+        required: true
+        default: false
+        type: boolean
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write # needed to create the release and tag
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Validate version
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::version must look like v1.2.3 (got '$VERSION')"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --release --locked
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          name="diskscope-${VERSION}-x86_64-pc-windows-msvc"
+          mkdir -p dist/"$name"
+          cp target/release/diskscope.exe dist/"$name"/
+          cp README.md dist/"$name"/
+          cp target/release/diskscope.exe dist/diskscope.exe
+          (cd dist && 7z a -tzip "$name.zip" "$name" > /dev/null)
+          (cd dist && sha256sum diskscope.exe "$name.zip" > SHA256SUMS.txt)
+          cat dist/SHA256SUMS.txt
+          echo "ASSET_NAME=$name" >> "$GITHUB_ENV"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ASSET_NAME }}
+          path: |
+            dist/diskscope.exe
+            dist/${{ env.ASSET_NAME }}.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Create GitHub release
+        if: ${{ inputs.publish }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          flags=""
+          if [ "$PRERELEASE" = "true" ]; then flags="--prerelease"; fi
+          gh release create "$VERSION" \
+            dist/diskscope.exe \
+            "dist/${ASSET_NAME}.zip" \
+            dist/SHA256SUMS.txt \
+            --target "${{ github.sha }}" \
+            --title "DiskScope $VERSION" \
+            --generate-notes \
+            $flags
