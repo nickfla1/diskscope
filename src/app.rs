@@ -73,6 +73,8 @@ struct TreemapState {
 }
 
 pub struct App {
+    #[cfg(target_os = "macos")]
+    simulators: crate::simulator::Manager,
     session: Session,
     ctx: egui::Context,
 
@@ -186,6 +188,8 @@ impl App {
         let session = Session::new(rt, crate::platform::current(), Arc::new(move || wake_ctx.request_repaint()));
         let path_input = session.platform().default_root();
         App {
+            #[cfg(target_os = "macos")]
+            simulators: crate::simulator::Manager::default(),
             session,
             ctx,
             drives: list_drives(),
@@ -660,6 +664,8 @@ impl App {
         }
         ui.horizontal_wrapped(|ui| {
             ui.colored_label(risk_color(Risk::Safe), format!("Safe: {}", fmt_size(safe)));
+            #[cfg(target_os = "macos")]
+            self.simulators.ui(ui);
             ui.colored_label(risk_color(Risk::Review), format!("Review: {}", fmt_size(review)));
             ui.separator();
             ui.label("min size");

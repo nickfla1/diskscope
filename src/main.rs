@@ -12,6 +12,8 @@ mod scan;
 mod session;
 mod treemap;
 mod views;
+#[cfg(target_os = "macos")]
+mod simulator;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

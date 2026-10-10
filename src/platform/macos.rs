@@ -25,13 +25,13 @@ pub fn skip_dir(p: &Path) -> bool {
 }
 
 fn is_app_bundle(name: &str) -> bool {
-    name.len() > 4 && name[name.len() - 4..].eq_ignore_ascii_case(".app")
+    name.len() > 4 && name.get(name.len() - 4..).is_some_and(|s| s.eq_ignore_ascii_case(".app"))
 }
 
 /// `com.google.Chrome` -> `Chrome`, `group.com.foo.Bar` -> `Bar`, `UBF8T346G9.Office` -> `Office`,
 /// `Safari.app` -> `Safari`.
 pub fn clean_bundle_name(name: &str) -> String {
-    let n = name.strip_suffix(".app").unwrap_or(name);
+    let n = if is_app_bundle(name) { &name[..name.len() - 4] } else { name };
     let n = n.strip_prefix("group.").unwrap_or(n);
     let n = match n.split_once('.') {
         Some((team, rest)) if team.len() == 10 && team.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()) => rest,
@@ -72,42 +72,32 @@ impl Platform for MacOs {
         let _ = path;
     }
 
-    /// Application bundles in `/Applications` (one folder level deep, e.g. `Utilities`) and in each
-    /// user's `~/Applications`.
+    /// Application bundles in the scanned scope, including system and personal applications.
+    /// Nested helper bundles belong to their enclosing application.
     fn installed(&self, tree: &Tree) -> Installed {
         let mut inst = Installed::default();
-        let mut roots: Vec<u32> = tree.child_named(0, "Applications").into_iter().collect();
-        if let Some(users) = tree.child_named(0, "Users") {
-            roots.extend(tree.live_children(users).filter_map(|u| tree.child_named(u, "Applications")));
-        }
         let mut register = |node: u32| {
-            let name = clean_bundle_name(tree.name(node));
+            let name = clean_bundle_name(if node == 0 {
+                Path::new(&tree.root_path).file_name().and_then(|n| n.to_str()).unwrap_or(tree.name(node))
+            } else { tree.name(node) });
             inst.nodes.insert(node);
             inst.names_lc.insert(name.to_lowercase());
             inst.registered.push(Registered { node, name, publisher: String::new() });
         };
-        for r in roots {
-            for c in tree.live_children(r) {
-                if !tree.node(c).is_dir() {
-                    continue;
-                }
-                if is_app_bundle(tree.name(c)) {
-                    register(c);
-                } else {
-                    for g in tree.live_children(c) {
-                        if tree.node(g).is_dir() && is_app_bundle(tree.name(g)) {
-                            register(g);
-                        }
-                    }
-                }
+        for c in 0..tree.nodes.len() as u32 {
+            if tree.node(c).is_dir() && !tree.is_gone(c) && is_app_bundle(tree.name(c))
+                && !tree.ancestors(c).any(|a| is_app_bundle(tree.name(a)))
+            {
+                register(c);
             }
         }
         inst
     }
 
     fn app_roots(&self, b: &mut AppBuilder, _inst: &Installed) {
+        let personal_scope = b.root_path().to_lowercase().contains("/users/");
         // `/Library` first: containers inside it are nearer roots and win.
-        if let Some(l) = b.at(0, &["Library"]) {
+        if !personal_scope && let Some(l) = b.at(0, &["Library"]) {
             b.add(l, "macOS system library", "Apple", AppKind::System);
         }
         for name in ["System", "usr", "bin", "sbin", "private"] {
@@ -120,7 +110,7 @@ impl Platform for MacOs {
                 b.add(x, "Homebrew", "", AppKind::Folder);
             }
         }
-        if let Some(l) = b.at(0, &["Library"]) {
+        if !personal_scope && let Some(l) = b.at(0, &["Library"]) {
             for sub in ["Application Support", "Caches", "Logs"] {
                 if let Some(c) = b.at(l, &[sub]) {
                     add_children(b, c);
@@ -128,9 +118,50 @@ impl Platform for MacOs {
             }
         }
 
-        let Some(users) = b.at(0, &["Users"]) else { return };
-        for u in b.dirs(users) {
-            let uname = b.name(u).to_string();
+        let mut user_roots: Vec<(u32, String)> = b.at(0, &["Users"])
+            .map(|users| b.dirs(users).into_iter().map(|u| (u, b.name(u).to_string())).collect())
+            .unwrap_or_default();
+        // A home-folder (the default), Library, or Library-container scan still has the same
+        // attribution anchors. Resolve only anchors that are inside the scanned scope.
+        let root = b.root_path().to_string();
+        let components: Vec<&str> = root.split('/').filter(|s| !s.is_empty()).collect();
+        if let Some(i) = components.iter().rposition(|s| s.eq_ignore_ascii_case("Users"))
+            && let Some(uname) = components.get(i + 1) {
+                let home = format!("/{}", components[..i + 2].join("/"));
+                if let Some(u) = b.absolute(&home) {
+                    user_roots.push((u, (*uname).to_string()));
+                } else {
+                    for sub in ["Application Support", "Caches", "Containers", "Group Containers", "Logs", "Saved Application State", "HTTPStorages", "WebKit"] {
+                        if let Some(c) = b.absolute(&format!("{home}/Library/{sub}")) {
+                            add_children(b, c);
+                        } else {
+                            let prefix = format!("{home}/Library/{sub}/");
+                            if let Some(rest) = root.strip_prefix(&prefix) {
+                                let name = rest.split('/').next().unwrap_or(rest);
+                                let apple = name.starts_with("com.apple.") || name.starts_with("group.com.apple.");
+                                let display = if apple { "Apple system data".to_string() } else { clean_bundle_name(name) };
+                                b.add(0, &display, "", if apple { AppKind::System } else { AppKind::Folder });
+                            }
+                        }
+                    }
+                    if let Some(d) = b.absolute(&format!("{home}/Library/Developer")) {
+                        b.add(d, "Xcode developer data", "Apple", AppKind::Folder);
+                    }
+                    for sub in ["Mail", "Messages", "Mobile Documents"] {
+                        if let Some(d) = b.absolute(&format!("{home}/Library/{sub}")) {
+                            let name = if sub == "Mobile Documents" { format!("iCloud Drive ({uname})") } else { sub.to_string() };
+                            b.add(d, &name, "Apple", if sub == "Mobile Documents" { AppKind::UserData } else { AppKind::Folder });
+                        }
+                    }
+                    if let Some(cs) = b.absolute(&format!("{home}/Library/CloudStorage")) {
+                        for d in b.dirs(cs) {
+                            let name = format!("{} ({uname})", b.name(d));
+                            b.add(d, &name, uname, AppKind::UserData);
+                        }
+                    }
+                }
+        }
+        for (u, uname) in user_roots {
             if matches!(uname.as_str(), "Shared" | "Guest") {
                 continue;
             }
@@ -203,8 +234,18 @@ impl Platform for MacOs {
             "archives" if path().ends_with("/library/developer/xcode/archives") => {
                 (Risk::Review, "Xcode archives - keep any you may need to symbolicate or resubmit")
             }
-            "coresimulator" if path().ends_with("/library/developer/coresimulator") => {
-                (Risk::Review, "iOS Simulator runtimes and devices - recreated by Xcode")
+            "caches" if path().ends_with("/library/developer/coresimulator/caches") => {
+                if path() == "/library/developer/coresimulator/caches" {
+                    (Risk::Caution, "System-owned simulator caches - managed by Xcode; use simulator runtime cleanup")
+                } else {
+                    (Risk::Safe, "Simulator caches - rebuilt by Xcode")
+                }
+            }
+            n if is_device_id(n) && tree.path_norm(tree.node(id).parent).ends_with("/library/developer/coresimulator/devices") => {
+                (Risk::Caution, "Simulator device and data - manage with `xcrun simctl list devices` and `xcrun simctl delete <UUID>`; deletion is permanent")
+            }
+            "profiles" if path().ends_with("/library/developer/coresimulator/profiles") => {
+                (Risk::Caution, "Simulator runtimes - remove individual versions in Xcode Settings > Components")
             }
             "backup" if path().ends_with("/mobilesync/backup") => (Risk::Review, "iPhone / iPad backups"),
             n if CACHE_DIR_NAMES.contains(&n) && path().contains("/library/") => (Risk::Safe, "Application / browser cache"),
@@ -237,6 +278,12 @@ impl Platform for MacOs {
     fn leftovers(&self, _tree: &Tree, _inst: &Installed) -> Vec<Suggestion> {
         Vec::new()
     }
+}
+
+fn is_device_id(name: &str) -> bool {
+    name.len() == 36 && name.bytes().enumerate().all(|(i, c)| {
+        if matches!(i, 8 | 13 | 18 | 23) { c == b'-' } else { c.is_ascii_hexdigit() }
+    })
 }
 
 /// Every child folder of a `~/Library` container is an application data folder. Apple's own bundle

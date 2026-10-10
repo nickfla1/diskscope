@@ -110,7 +110,7 @@ impl DirReader for StdReader {
         for ent in rd {
             let Ok(ent) = ent else { continue };
             let Ok(ft) = ent.file_type() else { continue };
-            if ft.is_symlink() {
+            if !ft.is_dir() && !ft.is_file() {
                 continue;
             }
             let Ok(md) = ent.metadata() else { continue };
@@ -139,6 +139,10 @@ impl DirReader for StdReader {
             {
                 use std::os::macos::fs::MetadataExt;
                 const SF_DATALESS: u32 = 0x4000_0000; // iCloud placeholder: data is not on this disk
+                const UF_HIDDEN: u32 = 0x0000_8000;
+                if md.st_flags() & UF_HIDDEN != 0 {
+                    attrs |= ATTR_HIDDEN;
+                }
                 if md.st_flags() & SF_DATALESS != 0 {
                     attrs |= ATTR_OFFLINE;
                 }

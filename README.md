@@ -57,6 +57,12 @@ Nothing is ever deleted without a confirmation dialog.
 - Deletion refuses the scan root and **Caution** (system-managed) items, and drops items nested inside another selected item.
 - Items are removed one at a time, the views update as they go, a progress bar with a Stop button shows in the status bar, and a failure on one item does not stop the rest.
 
+### Xcode simulators
+
+On macOS, **Cleanup → Manage simulator runtimes** lists Xcode's installed runtime images and their sizes, even when scanning only your home folder. Select **Remove…**, then confirm permanent removal. DiskScope runs `xcrun simctl runtime delete <UUID>` in the background and displays failures from Apple's tool. This operation skips Trash and may shut down simulators using the runtime. Refresh the list or rescan afterward. System-wide CoreSimulator caches are Caution entries rather than ordinary deletion suggestions.
+
+Cleanup lists individual simulator device folders under `~/Library/Developer/CoreSimulator/Devices`, rather than suggesting deletion of all CoreSimulator data. Devices are **Caution** entries: use `xcrun simctl list devices` to identify a device, then `xcrun simctl delete <UUID>` to permanently remove it and its data. Remove simulator runtime versions through **Xcode → Settings → Components**. Simulator caches are listed separately. Rescan after removing a device or runtime to update sizes.
+
 ## Architecture
 
 The program is split along seams so each part can be tested without the others (and without a window).

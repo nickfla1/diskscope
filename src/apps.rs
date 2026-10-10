@@ -5,6 +5,7 @@
 //!   2. the platform's own roots ([`Platform::app_roots`]): system areas, program folders, per-user
 //!      application data, user folders;
 //!   3. game libraries that look the same everywhere (`steamapps/common/<game>`, `Epic Games/<game>`).
+//!
 //! Attribution is then propagated top-down in a single linear pass; the nearest attributed ancestor
 //! wins, so an installed app nested inside a heuristic container keeps its own name.
 
@@ -60,7 +61,7 @@ impl<'a> AppBuilder<'a> {
     /// Declare `node` (a folder or file) as a root of the application `name`. Roots with the same
     /// name and kind are merged into one application; a node is only ever claimed once.
     pub fn add(&mut self, node: u32, name: &str, publisher: &str, kind: AppKind) {
-        if node == 0 || self.roots.contains_key(&node) || self.apps.len() >= u16::MAX as usize - 1 {
+        if self.roots.contains_key(&node) || self.apps.len() >= u16::MAX as usize - 1 {
             return;
         }
         let key = format!("{kind:?}|{}", name.to_lowercase());
@@ -81,6 +82,15 @@ impl<'a> AppBuilder<'a> {
 
     pub fn name(&self, node: u32) -> &'a str {
         self.tree.name(node)
+    }
+
+    pub fn root_path(&self) -> &'a str {
+        &self.tree.root_path
+    }
+
+    /// Resolve a platform path within the scanned scope.
+    pub fn absolute(&self, path: &str) -> Option<u32> {
+        self.tree.find(path)
     }
 
     /// Live child folders of `node`.

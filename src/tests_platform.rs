@@ -62,7 +62,8 @@ async fn macos_cleanup_rules() {
             ("Users/me/Library/Developer/Xcode/DerivedData/App-abc/b.o", 4096),
             ("Users/me/Library/Developer/Xcode/iOS DeviceSupport/16.0/sym", 4096),
             ("Users/me/Library/Developer/Xcode/Archives/2024/x.xcarchive/foo", 4096),
-            ("Users/me/Library/Developer/CoreSimulator/Devices/x/data", 4096),
+            ("Users/me/Library/Developer/CoreSimulator/Devices/12345678-1234-1234-1234-123456789ABC/data", 4096),
+            ("Users/me/Library/Developer/CoreSimulator/Caches/cache.bin", 4096),
             ("Users/me/Library/Application Support/MobileSync/Backup/abc/Manifest.db", 4096),
             ("Users/me/Library/Application Support/Slack/Cache/blob", 4096),
             ("Users/me/Library/Application Support/Slack/Local Storage/x", 4096),
@@ -85,7 +86,8 @@ async fn macos_cleanup_rules() {
         ("users/me/library/developer/xcode/deriveddata", Risk::Safe),
         ("users/me/library/developer/xcode/ios devicesupport", Risk::Safe),
         ("users/me/library/developer/xcode/archives", Risk::Review),
-        ("users/me/library/developer/coresimulator", Risk::Review),
+        ("users/me/library/developer/coresimulator/devices/12345678-1234-1234-1234-123456789abc", Risk::Caution),
+        ("users/me/library/developer/coresimulator/caches", Risk::Safe),
         ("users/me/library/application support/mobilesync/backup", Risk::Review),
         ("users/me/library/application support/slack/cache", Risk::Safe),
         ("users/me/.trash", Risk::Review),
@@ -190,12 +192,45 @@ async fn windows_cleanup_rules_still_hold_after_the_split() {
     assert_eq!(v, expect);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn macos_attribution_for_home_and_library_scans() {
+    let (root, _g, _) = build("mac-subtree", &[
+        ("Users/me/Applications/Mine.APP/Contents/x", 4096),
+        ("Users/me/Applications/Mine.APP/Contents/Helpers/Helper.app/x", 4096),
+        ("Users/me/Library/Application Support/Slack/x", 4096),
+        ("Users/me/Library/Containers/com.google.Chrome/Data/x", 4096),
+        ("Users/me/Documents/x", 4096),
+        ("Users/me/Applications/日本語/x", 4096),
+    ], &[]).await;
+    for scope in ["Users/me", "Users/me/Library", "Users/me/Library/Containers", "Users/me/Library/Containers/com.google.Chrome"] {
+        let tree = scan::scan(root.join(scope), MacOs.dir_reader(false), Arc::new(Progress::default()), Arc::new(AtomicBool::new(false)))
+            .await.unwrap();
+        let inst = MacOs.installed(&tree);
+        let (list, _) = apps::detect(&tree, &MacOs, &inst);
+        assert!(list.iter().any(|a| a.name == "Chrome"), "Chrome missing in {scope}");
+        if scope == "Users/me" {
+            assert_eq!(inst.names_lc, HashSet::from(["mine".to_string()]));
+            assert!(list.iter().any(|a| a.name == "Documents (me)"));
+        }
+        if !scope.starts_with("Users/me/Library/Containers") {
+            assert!(list.iter().any(|a| a.name == "Slack"), "Slack missing in {scope}");
+        }
+    }
+    let tree = scan::scan(root.join("Users/me/Applications/Mine.APP"), MacOs.dir_reader(false), Arc::new(Progress::default()), Arc::new(AtomicBool::new(false)))
+        .await.unwrap();
+    let inst = MacOs.installed(&tree);
+    assert_eq!(inst.names_lc, HashSet::from(["mine".to_string()]));
+    assert_eq!(apps::detect(&tree, &MacOs, &inst).0[0].name, "Mine");
+}
+
 #[test]
 fn macos_helpers() {
     assert_eq!(macos::clean_bundle_name("com.google.Chrome"), "Chrome");
     assert_eq!(macos::clean_bundle_name("group.com.foo.Bar"), "Bar");
     assert_eq!(macos::clean_bundle_name("UBF8T346G9.Office"), "Office");
     assert_eq!(macos::clean_bundle_name("Safari.app"), "Safari");
+    assert_eq!(macos::clean_bundle_name("Mine.APP"), "Mine");
+    assert_eq!(macos::clean_bundle_name("日本語"), "日本語");
     assert_eq!(macos::clean_bundle_name("Application Support"), "Application Support");
     assert_eq!(macos::clean_bundle_name("v1.2.3"), "v1.2.3", "version-like names are not reverse DNS");
     for p in ["/Volumes", "/System/Volumes", "/dev", "/private/var/vm"] {
