@@ -9,7 +9,7 @@ on:
         required: true
         type: string
       publish:
-        description: "Publish a GitHub Release (otherwise only upload the build as a workflow artifact)"
+        description: "Publish a GitHub Release (otherwise only upload the builds as workflow artifacts)"
         required: true
         default: true
         type: boolean
@@ -26,11 +26,10 @@ permissions:
   contents: write # needed to create the release and tag
 
 jobs:
-  build:
-    runs-on: windows-latest
+  validate:
+    runs-on: ubuntu-latest
     steps:
       - name: Validate version
-        shell: bash
         env:
           VERSION: ${{ inputs.version }}
         run: |
@@ -39,10 +38,12 @@ jobs:
             exit 1
           fi
 
+  windows:
+    needs: validate
+    runs-on: windows-latest
+    steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
-
       - uses: Swatinem/rust-cache@v2
 
       - name: Test
@@ -56,40 +57,99 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
         run: |
-          name="diskscope-${VERSION}-x86_64-pc-windows-msvc"
+          name="diskscope-${VERSION}-windows-x86_64"
           mkdir -p dist/"$name"
           cp target/release/diskscope.exe dist/"$name"/
-          cp README.md dist/"$name"/
-          cp target/release/diskscope.exe dist/diskscope.exe
-          (cd dist && 7z a -tzip "$name.zip" "$name" > /dev/null)
-          (cd dist && sha256sum diskscope.exe "$name.zip" > SHA256SUMS.txt)
-          cat dist/SHA256SUMS.txt
-          echo "ASSET_NAME=$name" >> "$GITHUB_ENV"
+          cp README.md LICENSE dist/"$name"/
+          cp target/release/diskscope.exe "dist/diskscope-${VERSION}-windows-x86_64.exe"
+          (cd dist && 7z a -tzip "$name.zip" "$name" > /dev/null && rm -r "$name")
+          ls dist
 
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.ASSET_NAME }}
-          path: |
-            dist/diskscope.exe
-            dist/${{ env.ASSET_NAME }}.zip
-            dist/SHA256SUMS.txt
+          name: windows
+          path: dist/*
           if-no-files-found: error
 
-      - name: Create GitHub release
-        if: ${{ inputs.publish }}
-        shell: bash
+  macos:
+    needs: validate
+    runs-on: macos-latest # Apple Silicon; the Intel half is cross-compiled
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --release --locked
+
+      - name: Build both architectures
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+
+      - name: Universal .app bundle
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          mkdir -p dist DiskScope.app/Contents/MacOS
+          lipo -create -output DiskScope.app/Contents/MacOS/diskscope \
+            target/aarch64-apple-darwin/release/diskscope \
+            target/x86_64-apple-darwin/release/diskscope
+          lipo -info DiskScope.app/Contents/MacOS/diskscope
+          cat > DiskScope.app/Contents/Info.plist <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>DiskScope</string>
+            <key>CFBundleDisplayName</key><string>DiskScope</string>
+            <key>CFBundleExecutable</key><string>diskscope</string>
+            <key>CFBundleIdentifier</key><string>dev.diskscope.app</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>${VERSION#v}</string>
+            <key>CFBundleVersion</key><string>${VERSION#v}</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          # Ad-hoc signature: lipo invalidates the per-architecture signatures, and Apple Silicon refuses
+          # to run unsigned code. This is not a Developer ID signature (see README: first launch).
+          codesign --force --deep --sign - DiskScope.app
+          ditto -c -k --keepParent DiskScope.app "dist/diskscope-${VERSION}-macos-universal.zip"
+          ls dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: [windows, macos]
+    if: ${{ inputs.publish }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums and release
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ inputs.version }}
           PRERELEASE: ${{ inputs.prerelease }}
         run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
           flags=""
           if [ "$PRERELEASE" = "true" ]; then flags="--prerelease"; fi
-          gh release create "$VERSION" \
-            dist/diskscope.exe \
-            "dist/${ASSET_NAME}.zip" \
-            dist/SHA256SUMS.txt \
+          gh release create "$VERSION" ./* \
+            --repo "${{ github.repository }}" \
             --target "${{ github.sha }}" \
             --title "DiskScope $VERSION" \
             --generate-notes \

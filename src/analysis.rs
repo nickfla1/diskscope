@@ -6,6 +6,7 @@ use std::collections::BinaryHeap;
 use crate::apps::{self, AppInfo};
 use crate::cleanup::{self, Suggestion};
 use crate::model::{NCAT, Tree, flag};
+use crate::platform::Platform;
 
 /// Bottom-up aggregation. Because children always have larger ids than their parent, walking the
 /// id range backwards guarantees every subtree is complete before its parent is visited.
@@ -76,8 +77,10 @@ pub struct Analysis {
     pub top_files: Vec<u32>,
 }
 
-pub fn analyze(tree: &Tree) -> Analysis {
-    let ((apps, app_of), (suggestions, risk_of)) = rayon::join(|| apps::detect(tree), || cleanup::detect(tree));
+pub fn analyze(tree: &Tree, platform: &dyn Platform) -> Analysis {
+    let inst = platform.installed(tree);
+    let ((apps, app_of), (suggestions, risk_of)) =
+        rayon::join(|| apps::detect(tree, platform, &inst), || cleanup::detect(tree, platform, &inst));
 
     let mut sizes = [0u64; NCAT];
     let mut counts = [0u64; NCAT];

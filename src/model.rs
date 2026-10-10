@@ -101,8 +101,15 @@ pub struct Tree {
     pub scanned_at: SystemTime,
 }
 
+/// Path separators accepted by [`Tree::find`]. On Unix a backslash is an ordinary file-name character.
+#[cfg(windows)]
 fn is_sep(c: char) -> bool {
     c == '\\' || c == '/'
+}
+#[cfg(not(windows))]
+#[allow(dead_code)] // only the Windows adapter (and tests) resolve paths with `find`
+fn is_sep(c: char) -> bool {
+    c == '/'
 }
 
 impl Tree {
@@ -124,6 +131,12 @@ impl Tree {
     pub fn children(&self, id: u32) -> Range<u32> {
         let n = &self.nodes[id as usize];
         n.child_start..n.child_start + n.child_count
+    }
+
+    /// Lower-case path with `/` separators, whatever the platform: the form platform rules match against.
+    pub fn path_norm(&self, id: u32) -> String {
+        let p = self.path(id).to_lowercase();
+        if MAIN_SEPARATOR == '/' { p } else { p.replace(MAIN_SEPARATOR, "/") }
     }
 
     pub fn path(&self, id: u32) -> String {
@@ -153,6 +166,7 @@ impl Tree {
     }
 
     /// Resolve an absolute path (case-insensitive) to a node.
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))] // used by the Windows adapter
     pub fn find(&self, p: &str) -> Option<u32> {
         let root = self.root_path.trim_end_matches(is_sep);
         let pl = p.trim_end_matches(is_sep);

@@ -9,7 +9,6 @@
 
 use std::ffi::OsString;
 use std::path::Path;
-use std::sync::Arc;
 
 use crate::model::{category_of, flag};
 
@@ -21,20 +20,6 @@ pub const ATTR_RECALL_ON_DATA_ACCESS: u32 = 0x400000;
 
 pub trait DirReader: Send + Sync {
     fn read(&self, dir: &Path, out: &mut DirBuilder) -> bool;
-}
-
-/// The reader for this platform. `on_disk`: report allocated size (what deleting frees) instead of the
-/// logical length; only the Win32 adapter can tell the two apart.
-pub fn system(on_disk: bool) -> Arc<dyn DirReader> {
-    #[cfg(windows)]
-    {
-        Arc::new(Win32Reader { on_disk })
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = on_disk;
-        Arc::new(StdReader)
-    }
 }
 
 pub(crate) struct Raw {
@@ -104,13 +89,23 @@ impl DirBuilder {
 
 // ---------------------------------------------------------------- std adapter
 
-/// Portable adapter: `std::fs::read_dir`. Reports logical length.
+/// Portable adapter: `std::fs::read_dir`. On Unix it can report allocated size (`st_blocks`), on macOS it
+/// also recognises iCloud "dataless" placeholders, and dot-files are flagged hidden.
+/// `skip`: directories (by exact path) that are listed as empty instead of entered.
+#[derive(Default)]
 #[cfg_attr(all(windows, not(test)), allow(dead_code))]
-pub struct StdReader;
+pub struct StdReader {
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub on_disk: bool,
+    pub skip: Option<fn(&Path) -> bool>,
+}
 
 impl DirReader for StdReader {
     fn read(&self, dir: &Path, out: &mut DirBuilder) -> bool {
         use std::time::UNIX_EPOCH;
+        if self.skip.is_some_and(|f| f(dir)) {
+            return true;
+        }
         let Ok(rd) = std::fs::read_dir(dir) else { return false };
         for ent in rd {
             let Ok(ent) = ent else { continue };
@@ -128,13 +123,34 @@ impl DirReader for StdReader {
                 .map(|d| d.as_secs().min(u32::MAX as u64) as u32)
                 .unwrap_or(0);
             #[cfg(windows)]
-            let attrs = {
+            #[allow(unused_mut)]
+            let mut attrs = {
                 use std::os::windows::fs::MetadataExt;
                 md.file_attributes()
             };
             #[cfg(not(windows))]
-            let attrs = 0;
-            out.push_with(&name, || os_name.clone(), ft.is_dir(), md.len(), mtime, attrs);
+            #[allow(unused_mut)]
+            let mut attrs = 0u32;
+            #[cfg(unix)]
+            if name.starts_with('.') {
+                attrs |= ATTR_HIDDEN;
+            }
+            #[cfg(target_os = "macos")]
+            {
+                use std::os::macos::fs::MetadataExt;
+                const SF_DATALESS: u32 = 0x4000_0000; // iCloud placeholder: data is not on this disk
+                if md.st_flags() & SF_DATALESS != 0 {
+                    attrs |= ATTR_OFFLINE;
+                }
+            }
+            #[cfg(unix)]
+            let size = {
+                use std::os::unix::fs::MetadataExt;
+                if self.on_disk { md.blocks() * 512 } else { md.len() }
+            };
+            #[cfg(not(unix))]
+            let size = md.len();
+            out.push_with(&name, || os_name.clone(), ft.is_dir(), size, mtime, attrs);
         }
         true
     }

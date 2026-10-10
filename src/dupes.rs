@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering::Relaxed};
 use rayon::prelude::*;
 
 use crate::model::{Tree, flag};
+use crate::platform::Platform;
 
 #[derive(Default)]
 pub struct DupProgress {
@@ -48,14 +49,6 @@ fn hash_file(path: &PathBuf, limit: Option<usize>) -> Option<[u8; 32]> {
     Some(*h.finalize().as_bytes())
 }
 
-fn excluded(path_lc: &str) -> bool {
-    // Hard-linked system files (WinSxS) and application installs look like duplicates but are not
-    // safe to remove.
-    ["\\windows\\", "\\program files", "\\programdata\\", "\\$recycle.bin", "\\system volume information"]
-        .iter()
-        .any(|p| path_lc.contains(p))
-}
-
 fn regroup(
     groups: Vec<Vec<(u32, PathBuf)>>,
     limit: Option<usize>,
@@ -83,7 +76,13 @@ fn regroup(
         .collect()
 }
 
-pub fn find(tree: &RwLock<Tree>, min_size: u64, prog: &DupProgress, cancel: &AtomicBool) -> Vec<DupGroup> {
+pub fn find(
+    tree: &RwLock<Tree>,
+    min_size: u64,
+    prog: &DupProgress,
+    cancel: &AtomicBool,
+    platform: &dyn Platform,
+) -> Vec<DupGroup> {
     prog.stage.store(1, Relaxed);
     let mut size_of: Vec<u64> = Vec::new();
     let groups: Vec<Vec<(u32, PathBuf)>> = {
@@ -104,7 +103,7 @@ pub fn find(tree: &RwLock<Tree>, min_size: u64, prog: &DupProgress, cancel: &Ato
                 v.into_iter()
                     .filter_map(|id| {
                         let p = t.path(id);
-                        (!excluded(&p.to_lowercase())).then(|| (id, PathBuf::from(p)))
+                        (!platform.is_protected(&t.path_norm(id))).then(|| (id, PathBuf::from(p)))
                     })
                     .collect::<Vec<_>>()
             })

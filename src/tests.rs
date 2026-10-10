@@ -39,7 +39,7 @@ pub(crate) fn fixture() -> (PathBuf, impl Drop) {
 
 async fn scan_fixture(root: PathBuf) -> (Tree, Arc<Progress>) {
     let progress = Arc::new(Progress::default());
-    let tree = scan::scan(root, crate::dirreader::system(false), progress.clone(), Arc::new(AtomicBool::new(false))).await.unwrap();
+    let tree = scan::scan(root, crate::platform::current().dir_reader(false), progress.clone(), Arc::new(AtomicBool::new(false))).await.unwrap();
     (tree, progress)
 }
 
@@ -82,7 +82,7 @@ async fn remove_updates_ancestors() {
 async fn cleanup_and_types() {
     let (root, _g) = fixture();
     let (tree, _) = scan_fixture(root.clone()).await;
-    let a = analysis::analyze(&tree);
+    let a = analysis::analyze(&tree, crate::platform::current());
     let nm = tree.find(&root.join("proj/node_modules").to_string_lossy()).unwrap();
     // node_modules next to package.json is Safe; the file inside it is not listed separately
     let s = a.suggestions.iter().find(|s| s.node == nm);

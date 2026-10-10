@@ -1,17 +1,21 @@
-//! Rule-based detection of deletable files and folders.
+//! Rule-based detection of deletable files and folders (platform-neutral engine).
 //!
 //! Nothing here deletes anything; it only classifies. Each suggestion carries a risk level:
 //!   * Safe    – regenerated automatically or by a single command (caches, build output, temp files)
 //!   * Review  – almost certainly removable, but the user should look first (logs, old installers, ...)
 //!   * Caution – system-managed; shown for information, deletion is not offered
-//! Rules are keyed on the *name* of a node first (cheap), and only then look at the full path or at
-//! sibling files (e.g. `node_modules` next to a `package.json`).
+//!
+//! The portable rules (development artifacts, temp/dump/log/backup files, old installers, large old
+//! files) live here. Rules that depend on where the operating system keeps things come from the
+//! [`Platform`]. Rules are keyed on the *name* of a node first (cheap), and only then look at the full
+//! normalised path or at sibling files (e.g. `node_modules` next to a `package.json`).
 
 use std::collections::HashSet;
 
 use rayon::prelude::*;
 
 use crate::model::{Tree, flag, now_unix};
+use crate::platform::{CACHE_DIR_NAMES, Installed, Platform, RuleHit};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord)]
 pub enum Risk {
@@ -54,17 +58,18 @@ fn has_sibling_ext(tree: &Tree, id: u32, exts: &[&str]) -> bool {
     })
 }
 
-fn ext_in(name: &str, exts: &[&str]) -> bool {
+/// Does `name` end in `.ext` for one of `exts` (case-insensitive)?
+pub fn ext_in(name: &str, exts: &[&str]) -> bool {
     match name.rfind('.') {
         Some(d) => exts.iter().any(|e| name[d + 1..].eq_ignore_ascii_case(e)),
         None => false,
     }
 }
 
-fn classify_dir(tree: &Tree, id: u32, name: &str) -> Option<(Risk, &'static str)> {
-    let l = name.to_ascii_lowercase();
-    let path = || tree.path(id).to_lowercase();
-    Some(match l.as_str() {
+/// Portable folder rules. `l` is the lower-cased name.
+fn classify_dir_common(tree: &Tree, id: u32, l: &str) -> Option<RuleHit> {
+    let path = || tree.path_norm(id);
+    Some(match l {
         "node_modules" => {
             if has_sibling(tree, id, "package.json") {
                 (Risk::Safe, "npm dependencies - restore with `npm install`")
@@ -93,62 +98,32 @@ fn classify_dir(tree: &Tree, id: u32, name: &str) -> Option<(Risk, &'static str)
         ".venv" | "venv" if has_sibling(tree, id, "requirements.txt") || has_sibling(tree, id, "pyproject.toml") => {
             (Risk::Review, "Python virtual environment - can be recreated")
         }
-        "$recycle.bin" => (Risk::Review, "Recycle Bin contents - empty it from Explorer"),
-        "windows.old" => (Risk::Review, "Previous Windows installation - remove via Disk Cleanup"),
-        "$windows.~bt" | "$windows.~ws" | "$sysreset" | "$winreagent" => (Risk::Review, "Windows upgrade / reset leftovers"),
-        "temp" | "tmp" => {
-            let p = path();
-            if p.contains("\\appdata\\local\\temp") || p.ends_with("\\windows\\temp") {
-                (Risk::Safe, "Temporary files")
-            } else {
-                return None;
-            }
-        }
-        "cache" | "code cache" | "gpucache" | "cache2" | "shadercache" | "grshadercache" | "dawncache"
-        | "dawngraphitecache" | "dawnwebgpucache" | "media cache" => {
-            let p = path();
-            if p.contains("\\appdata\\") || p.contains("\\.cache\\") {
-                (Risk::Safe, "Application / browser cache")
-            } else {
-                return None;
-            }
-        }
-        "inetcache" => (Risk::Safe, "Internet cache"),
-        "d3dscache" => (Risk::Safe, "DirectX shader cache"),
-        "crashdumps" | "minidump" | "livekernelreports" => (Risk::Safe, "Crash dumps"),
-        "wer" if path().contains("\\microsoft\\windows\\wer") => (Risk::Safe, "Windows Error Reporting data"),
-        "download" if path().ends_with("\\windows\\softwaredistribution\\download") => {
-            (Risk::Review, "Windows Update download cache")
-        }
-        "$patchcache$" => (Risk::Review, "Windows Installer patch cache"),
+        ".cache" => (Risk::Review, "User cache folder - contents are re-downloaded when needed"),
+        n if CACHE_DIR_NAMES.contains(&n) && path().contains("/.cache/") => (Risk::Safe, "Application / browser cache"),
         "_cacache" | "npm-cache" => (Risk::Safe, "npm download cache"),
-        "packages" if path().ends_with("\\.nuget\\packages") => (Risk::Review, "NuGet package cache - re-downloaded on demand"),
-        "registry" if path().ends_with("\\.cargo\\registry") => (Risk::Review, "Cargo registry cache - re-downloaded on demand"),
-        "repository" if path().ends_with("\\.m2\\repository") => (Risk::Review, "Maven local repository - re-downloaded on demand"),
-        "caches" if path().ends_with("\\.gradle\\caches") => (Risk::Review, "Gradle caches - re-downloaded on demand"),
+        "packages" if path().ends_with("/.nuget/packages") => (Risk::Review, "NuGet package cache - re-downloaded on demand"),
+        "registry" if path().ends_with("/.cargo/registry") => (Risk::Review, "Cargo registry cache - re-downloaded on demand"),
+        "repository" if path().ends_with("/.m2/repository") => (Risk::Review, "Maven local repository - re-downloaded on demand"),
+        "caches" if path().ends_with("/.gradle/caches") => (Risk::Review, "Gradle caches - re-downloaded on demand"),
         _ => return None,
     })
 }
 
-fn classify_file(tree: &Tree, id: u32, name: &str, size: u64, mtime: u32, now: u32) -> Option<(Risk, &'static str)> {
-    let l = name.to_ascii_lowercase();
-    match l.as_str() {
-        "hiberfil.sys" => return Some((Risk::Caution, "Hibernation file - disable with `powercfg /h off`")),
-        "pagefile.sys" | "swapfile.sys" => return Some((Risk::Caution, "Virtual memory file - managed by Windows")),
-        "memory.dmp" => return Some((Risk::Safe, "Kernel crash dump")),
-        _ => {}
-    }
-    if l.starts_with("thumbcache_") && l.ends_with(".db") {
-        return Some((Risk::Safe, "Thumbnail cache"));
-    }
+/// Portable file rules (platform file rules are tried first).
+fn classify_file_common(
+    tree: &Tree,
+    id: u32,
+    name: &str,
+    size: u64,
+    mtime: u32,
+    now: u32,
+    platform: &dyn Platform,
+) -> Option<RuleHit> {
     if ext_in(name, &["dmp", "mdmp"]) {
         return Some((Risk::Safe, "Crash dump"));
     }
     if ext_in(name, &["tmp", "temp"]) {
         return Some((Risk::Safe, "Temporary file"));
-    }
-    if ext_in(name, &["etl"]) {
-        return Some((Risk::Safe, "Event trace log"));
     }
     if ext_in(name, &["log"]) && size >= 10 << 20 {
         return Some((Risk::Review, "Large log file"));
@@ -157,115 +132,17 @@ fn classify_file(tree: &Tree, id: u32, name: &str, size: u64, mtime: u32, now: u
         return Some((Risk::Review, "Backup / leftover file"));
     }
     let old = |days: u32| mtime != 0 && now.saturating_sub(mtime) > days * DAY;
-    if ext_in(name, &["exe", "msi", "iso", "zip", "7z", "rar"]) && old(90) && tree.path(id).to_lowercase().contains("\\downloads\\") {
+    if ext_in(name, platform.installer_exts()) && old(90) && tree.path_norm(id).contains("/downloads/") {
         return Some((Risk::Review, "Old installer / archive in Downloads"));
     }
-    if size >= 1 << 30 && old(365) {
-        let p = tree.path(id).to_lowercase();
-        if !p.contains("\\windows\\") && !p.contains("\\program files") {
-            return Some((Risk::Review, "Large file untouched for over a year"));
-        }
+    if size >= 1 << 30 && old(365) && !platform.is_protected(&tree.path_norm(id)) {
+        return Some((Risk::Review, "Large file untouched for over a year"));
     }
     None
 }
 
 /// Returns the (de-duplicated) suggestions and a per-node risk map for the treemap.
-pub fn detect(tree: &Tree) -> (Vec<Suggestion>, Vec<u8>) {
-    detect_with(tree, &crate::apps::installed(tree))
-}
-
-// ---------------------------------------------------------------- uninstall leftovers
-
-/// Extensions that mean "a program lives here".
-const BINARY_EXTS: [&str; 8] = ["exe", "dll", "sys", "ocx", "msi", "scr", "cpl", "jar"];
-
-/// Program Files children that are shared tooling or OS-owned (config-only, no binaries of their own);
-/// never judged. `Windows*` and `Microsoft*` folders are skipped by prefix as well.
-const PF_SKIP: [&str; 10] = [
-    "common files",
-    "windowsapps",
-    "modifiablewindowsapps",
-    "msbuild",
-    "nuget",
-    "vulkanrt",
-    "dotnet",
-    "reference assemblies",
-    "internet explorer",
-    "windowspowershell",
-];
-
-fn has_binary(tree: &Tree, root: u32) -> bool {
-    let mut stack = vec![root];
-    while let Some(d) = stack.pop() {
-        for c in tree.live_children(d) {
-            let n = tree.node(c);
-            if n.is_dir() {
-                stack.push(c);
-            } else if ext_in(tree.name(c), &BINARY_EXTS) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// `Name_<13 chars of a-z0-9>`: the shape of a Store package family folder. Browser sandbox containers
-/// (`cr.sb.*`, `fx.sb.*`) and similar are not packages and must not be judged.
-fn looks_like_package_family(name: &str) -> bool {
-    match name.split_once('_') {
-        Some((n, publisher)) => {
-            !n.is_empty()
-                && publisher.len() == 13
-                && publisher.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
-                && !n.contains('_')
-        }
-        None => false,
-    }
-}
-
-/// Folders that look like remains of uninstalled programs:
-///   * a `Program Files` folder that is not any registered program's install location and holds no
-///     executables or libraries at all (only data is left);
-///   * a Store-package data folder in the current user's `%LOCALAPPDATA%Packages` whose package is no
-///     longer installed.
-/// Always graded Review: the signal is a heuristic.
-pub fn leftovers(tree: &Tree, inst: &crate::apps::Installed) -> Vec<Suggestion> {
-    let mut out = Vec::new();
-    let mut consider = |c: u32, reason: &'static str| {
-        let n = tree.node(c);
-        if n.is_dir() && !n.is_deleted() && n.size > 0 {
-            out.push(Suggestion { node: c, size: n.size, risk: Risk::Review, reason, leftover: true });
-        }
-    };
-
-    for pf in ["Program Files", "Program Files (x86)"] {
-        let Some(pfn) = tree.child_named(0, pf) else { continue };
-        for c in tree.live_children(pfn) {
-            let lc = tree.name(c).to_ascii_lowercase();
-            if PF_SKIP.contains(&lc.as_str()) || lc.starts_with("windows") || lc.starts_with("microsoft") || inst.nodes.contains(&c) {
-                continue;
-            }
-            if tree.node(c).is_dir() && !has_binary(tree, c) {
-                consider(c, "Program Files folder with no installed program and no executables - uninstall leftovers");
-            }
-        }
-    }
-
-    if let (Some(dir), Some(fams)) = (&inst.user_packages_dir, &inst.package_families) {
-        if let Some(pn) = tree.find(dir) {
-            for c in tree.live_children(pn) {
-                let name = tree.name(c);
-                if looks_like_package_family(name) && !fams.contains(&name.to_lowercase()) {
-                    consider(c, "Data of a Store app that is no longer installed");
-                }
-            }
-        }
-    }
-    out
-}
-
-/// [`detect`] with an explicit view of what is installed (tests pass a fake).
-pub fn detect_with(tree: &Tree, inst: &crate::apps::Installed) -> (Vec<Suggestion>, Vec<u8>) {
+pub fn detect(tree: &Tree, platform: &dyn Platform, inst: &Installed) -> (Vec<Suggestion>, Vec<u8>) {
     let now = now_unix();
     let n = tree.nodes.len();
 
@@ -278,18 +155,22 @@ pub fn detect_with(tree: &Tree, inst: &crate::apps::Installed) -> (Vec<Suggestio
             }
             let name = tree.name(id);
             let (risk, reason) = if nd.is_dir() {
-                classify_dir(tree, id, name)?
+                let l = name.to_ascii_lowercase();
+                classify_dir_common(tree, id, &l).or_else(|| platform.classify_dir(tree, id, &l))?
             } else {
                 if nd.size < 64 * 1024 {
                     return None; // keep the hot loop cheap: tiny files are never worth listing
                 }
-                classify_file(tree, id, name, nd.size, nd.mtime, now)?
+                let l = name.to_ascii_lowercase();
+                platform
+                    .classify_file(tree, id, &l, nd.size)
+                    .or_else(|| classify_file_common(tree, id, name, nd.size, nd.mtime, now, platform))?
             };
             Some(Suggestion { node: id, size: nd.size, risk, reason, leftover: false })
         })
         .collect();
 
-    found.extend(leftovers(tree, inst));
+    found.extend(platform.leftovers(tree, inst));
 
     // Drop anything nested inside another suggestion (e.g. the target dir inside node_modules).
     let ids: HashSet<u32> = found.iter().map(|s| s.node).collect();

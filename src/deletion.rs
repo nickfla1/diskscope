@@ -22,8 +22,8 @@ pub trait Remover: Send + Sync {
     fn permanent(&self) -> bool;
 }
 
-pub struct RecycleBin;
-impl Remover for RecycleBin {
+pub struct SystemTrash;
+impl Remover for SystemTrash {
     fn remove(&self, path: &str, _is_dir: bool) -> Result<(), String> {
         trash::delete(path).map_err(|e| e.to_string())
     }

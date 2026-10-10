@@ -6,7 +6,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use crate::apps::Installed;
+use crate::platform::windows::Windows;
+use crate::platform::{Installed, Platform};
 use crate::cleanup::{self, Risk};
 use crate::model::Tree;
 use crate::scan::{self, Progress};
@@ -25,7 +26,9 @@ fn touch(root: &PathBuf, rel: &str) {
 }
 
 async fn build() -> (PathBuf, Guard, Tree) {
-    let root = std::env::temp_dir().join(format!("diskscope-leftovers-{}", std::process::id()));
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("diskscope-leftovers-{}-{n}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     let g = Guard(root.clone());
     // Program Files
@@ -44,7 +47,7 @@ async fn build() -> (PathBuf, Guard, Tree) {
     touch(&root, &format!("{pk}/cr.sb.odm13DA26A24F6CD7A2E509D4AAADC/x.dat"));
     touch(&root, &format!("{pk}/Name_toolongpublisherid1/x.dat"));
     touch(&root, "Users/other/AppData/Local/Packages/Gone2.App_abcdefghjkmnp/x.dat");
-    let tree = scan::scan(root.clone(), crate::dirreader::system(false), Arc::new(Progress::default()), Arc::new(AtomicBool::new(false)))
+    let tree = scan::scan(root.clone(), crate::platform::current().dir_reader(false), Arc::new(Progress::default()), Arc::new(AtomicBool::new(false)))
         .await
         .unwrap();
     (root, g, tree)
@@ -55,6 +58,7 @@ fn installed(tree: &Tree, root: &PathBuf, families: Option<&[&str]>) -> Installe
         nodes: HashSet::from([tree.find(&root.join("Program Files/Registered").to_string_lossy()).unwrap()]),
         package_families: families.map(|f| f.iter().map(|s| s.to_lowercase()).collect()),
         user_packages_dir: Some(root.join("Users/me/AppData/Local/Packages").to_string_lossy().to_string()),
+        ..Default::default()
     }
 }
 
@@ -66,7 +70,7 @@ fn names(tree: &Tree, s: &[cleanup::Suggestion]) -> HashSet<String> {
 async fn program_files_and_store_package_leftovers() {
     let (root, _g, tree) = build().await;
     let inst = installed(&tree, &root, Some(&["Live.App_abcdefghjkmnp"]));
-    let found = cleanup::leftovers(&tree, &inst);
+    let found = Windows.leftovers(&tree, &inst);
     assert!(found.iter().all(|s| s.leftover && s.risk == Risk::Review));
     assert_eq!(
         names(&tree, &found),
@@ -83,7 +87,7 @@ async fn program_files_and_store_package_leftovers() {
 async fn no_store_rule_without_a_package_list() {
     let (root, _g, tree) = build().await;
     let inst = installed(&tree, &root, None); // registry unreadable
-    let found = cleanup::leftovers(&tree, &inst);
+    let found = Windows.leftovers(&tree, &inst);
     assert!(names(&tree, &found).iter().all(|n| n.starts_with("Program Files")), "must not guess about Store apps");
 }
 
@@ -91,7 +95,7 @@ async fn no_store_rule_without_a_package_list() {
 async fn leftovers_flow_through_detect_with_and_colour_the_tree() {
     let (root, _g, tree) = build().await;
     let inst = installed(&tree, &root, Some(&["Live.App_abcdefghjkmnp"]));
-    let (sugg, risk_of) = cleanup::detect_with(&tree, &inst);
+    let (sugg, risk_of) = cleanup::detect(&tree, &Windows, &inst);
     let old = tree.find(&root.join("Program Files/OldApp").to_string_lossy()).unwrap();
     assert!(sugg.iter().any(|s| s.node == old && s.leftover));
     let inner = tree.find(&root.join("Program Files/OldApp/cache/blob.dat").to_string_lossy()).unwrap();

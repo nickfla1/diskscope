@@ -1,15 +1,17 @@
-//! Application attribution.
+//! Application attribution engine (platform-neutral).
 //!
-//! Directories are attributed to applications from two sources:
-//!   1. the Windows "Uninstall" registry keys (`InstallLocation` -> display name/publisher), and
-//!   2. well-known containers (Program Files, ProgramData, per-user AppData, Steam/Epic libraries,
-//!      user profile folders) where each child folder is treated as one application.
+//! Directories are attributed to applications from three sources:
+//!   1. programs the OS reports as installed (`Installed::registered`), most precise, added first;
+//!   2. the platform's own roots ([`Platform::app_roots`]): system areas, program folders, per-user
+//!      application data, user folders;
+//!   3. game libraries that look the same everywhere (`steamapps/common/<game>`, `Epic Games/<game>`).
 //! Attribution is then propagated top-down in a single linear pass; the nearest attributed ancestor
-//! wins, so a registry-detected app nested inside a heuristic container keeps its own name.
+//! wins, so an installed app nested inside a heuristic container keeps its own name.
 
 use std::collections::HashMap;
 
 use crate::model::{Tree, flag};
+use crate::platform::{Installed, Platform};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AppKind {
@@ -42,15 +44,22 @@ pub struct AppInfo {
     pub files: u64,
 }
 
-struct Builder<'a> {
+/// What a platform adapter uses to declare "this folder belongs to that application".
+pub struct AppBuilder<'a> {
     tree: &'a Tree,
     apps: Vec<AppInfo>,
     by_name: HashMap<String, u16>,
     roots: HashMap<u32, u16>,
 }
 
-impl<'a> Builder<'a> {
-    fn add(&mut self, node: u32, name: &str, publisher: &str, kind: AppKind) {
+impl<'a> AppBuilder<'a> {
+    fn new(tree: &'a Tree) -> Self {
+        AppBuilder { tree, apps: Vec::new(), by_name: HashMap::new(), roots: HashMap::new() }
+    }
+
+    /// Declare `node` (a folder or file) as a root of the application `name`. Roots with the same
+    /// name and kind are merged into one application; a node is only ever claimed once.
+    pub fn add(&mut self, node: u32, name: &str, publisher: &str, kind: AppKind) {
         if node == 0 || self.roots.contains_key(&node) || self.apps.len() >= u16::MAX as usize - 1 {
             return;
         }
@@ -70,7 +79,12 @@ impl<'a> Builder<'a> {
         self.roots.insert(node, id);
     }
 
-    fn dirs(&self, node: u32) -> Vec<u32> {
+    pub fn name(&self, node: u32) -> &'a str {
+        self.tree.name(node)
+    }
+
+    /// Live child folders of `node`.
+    pub fn dirs(&self, node: u32) -> Vec<u32> {
         self.tree
             .children(node)
             .filter(|&c| {
@@ -80,7 +94,8 @@ impl<'a> Builder<'a> {
             .collect()
     }
 
-    fn at(&self, from: u32, path: &[&str]) -> Option<u32> {
+    /// Follow `path` (case-insensitive names) down from `from`.
+    pub fn at(&self, from: u32, path: &[&str]) -> Option<u32> {
         let mut cur = from;
         for p in path {
             cur = self.tree.child_named(cur, p)?;
@@ -88,9 +103,11 @@ impl<'a> Builder<'a> {
         Some(cur)
     }
 
-    /// Every child folder of `container` is an application. Vendor folders (Microsoft, Google, ...)
-    /// are split one level further so "Google\Chrome" shows up as "Google Chrome".
-    fn container(&mut self, container: u32, kind: AppKind, skip: &[&str]) {
+    /// Every child folder of `container` is an application; `clean` turns the folder name into a
+    /// display name. Vendor folders (Microsoft, Google, ...) are split one level further so
+    /// "Google/Chrome" shows up as "Google Chrome".
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))] // used by the Windows adapter
+    pub fn container(&mut self, container: u32, kind: AppKind, skip: &[&str], clean: fn(&str) -> String) {
         const VENDORS: [&str; 10] =
             ["microsoft", "google", "adobe", "jetbrains", "mozilla", "apple", "intel", "nvidia corporation", "amd", "oracle"];
         for d in self.dirs(container) {
@@ -108,203 +125,25 @@ impl<'a> Builder<'a> {
                 let vname = format!("{name} (shared)");
                 self.add(d, &vname, &name, kind);
             } else {
-                // MSIX package ids look like "Vendor.App_8wekyb3d8bbwe"
-                let clean = name.split('_').next().unwrap_or(&name).to_string();
-                self.add(d, &clean, "", kind);
+                self.add(d, &clean(&name), "", kind);
             }
         }
     }
 }
 
-#[cfg(windows)]
-fn registry_apps() -> Vec<(String, String, String)> {
-    use winreg::RegKey;
-    use winreg::enums::*;
-
-    let mut out = Vec::new();
-    let hives = [
-        (HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
-        (HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
-        (HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Uninstall"),
-    ];
-    for (hive, path) in hives {
-        let Ok(key) = RegKey::predef(hive).open_subkey_with_flags(path, KEY_READ) else { continue };
-        for sub in key.enum_keys().flatten() {
-            let Ok(k) = key.open_subkey_with_flags(&sub, KEY_READ) else { continue };
-            let Ok(name) = k.get_value::<String, _>("DisplayName") else { continue };
-            if k.get_value::<u32, _>("SystemComponent").unwrap_or(0) == 1 {
-                continue;
-            }
-            let publisher = k.get_value::<String, _>("Publisher").unwrap_or_default();
-            let mut loc = k.get_value::<String, _>("InstallLocation").unwrap_or_default();
-            if loc.trim().is_empty() {
-                // Fall back to the folder of the icon / uninstaller executable.
-                let icon = k
-                    .get_value::<String, _>("DisplayIcon")
-                    .or_else(|_| k.get_value::<String, _>("UninstallString"))
-                    .unwrap_or_default();
-                let icon = icon.trim().trim_start_matches('"');
-                let icon = icon.split('"').next().unwrap_or("");
-                let icon = icon.split(',').next().unwrap_or("");
-                if let Some(parent) = std::path::Path::new(icon).parent() {
-                    loc = parent.to_string_lossy().to_string();
-                }
-            }
-            let loc = loc.trim().trim_matches('"').trim_end_matches('\\').to_string();
-            if loc.len() > 3 {
-                out.push((name, loc, publisher));
-            }
-        }
-    }
-    out
-}
-#[cfg(not(windows))]
-fn registry_apps() -> Vec<(String, String, String)> {
-    Vec::new()
-}
-
-/// What the registry says is installed right now. Used to tell live installs from uninstall leftovers.
-#[derive(Default)]
-pub struct Installed {
-    /// Nodes that are the `InstallLocation` of a registered program.
-    pub nodes: std::collections::HashSet<u32>,
-    /// Lower-cased Store package family names (`Name_<publisherid>`) known to Windows; `None` if the
-    /// registry could not be read (then no Store-package rule may fire).
-    pub package_families: Option<std::collections::HashSet<String>>,
-    /// The *current user's* `%LOCALAPPDATA%\Packages`. Other users' packages are never judged, because
-    /// their installed-package lists live in registry hives that are not loaded.
-    pub user_packages_dir: Option<String>,
-}
-
-#[cfg(windows)]
-fn package_families() -> Option<std::collections::HashSet<String>> {
-    use winreg::RegKey;
-    use winreg::enums::*;
-    const SUB: &str = r"Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages";
-    let mut set = std::collections::HashSet::new();
-    for (hive, path) in [
-        (HKEY_CURRENT_USER, format!(r"Software\Classes\{SUB}")),
-        (HKEY_LOCAL_MACHINE, format!(r"SOFTWARE\Classes\{SUB}")),
-    ] {
-        let Ok(key) = RegKey::predef(hive).open_subkey_with_flags(path, KEY_READ) else { continue };
-        for sub in key.enum_keys().flatten() {
-            // full name: Name_Version_Arch_ResourceId_PublisherId  ->  family: Name_PublisherId
-            let parts: Vec<&str> = sub.split('_').collect();
-            if parts.len() >= 2 {
-                set.insert(format!("{}_{}", parts[0], parts[parts.len() - 1]).to_lowercase());
-            }
-        }
-    }
-    (!set.is_empty()).then_some(set)
-}
-#[cfg(not(windows))]
-fn package_families() -> Option<std::collections::HashSet<String>> {
-    None
-}
-
-pub fn installed(tree: &Tree) -> Installed {
-    let mut inst = Installed::default();
-    for (_, loc, _) in registry_apps() {
-        if let Some(node) = tree.find(&loc) {
-            inst.nodes.insert(node);
-        }
-    }
-    inst.package_families = package_families();
-    inst.user_packages_dir = std::env::var("LOCALAPPDATA").ok().map(|p| format!("{}\\Packages", p.trim_end_matches('\\')));
-    inst
-}
-
-pub fn detect(tree: &Tree) -> (Vec<AppInfo>, Vec<u16>) {
-    let mut b = Builder { tree, apps: Vec::new(), by_name: HashMap::new(), roots: HashMap::new() };
+pub fn detect(tree: &Tree, platform: &dyn Platform, inst: &Installed) -> (Vec<AppInfo>, Vec<u16>) {
+    let mut b = AppBuilder::new(tree);
     let n = tree.nodes.len();
 
-    // 1. Registry-declared installs (most precise, inserted first so they win over heuristics).
-    for (name, loc, publisher) in registry_apps() {
-        if let Some(node) = tree.find(&loc) {
-            let lc = tree.name(node).to_lowercase();
-            if node != 0 && !matches!(lc.as_str(), "windows" | "system32" | "users" | "program files" | "program files (x86)") {
-                b.add(node, &name, &publisher, AppKind::Installed);
-            }
-        }
+    // 1. Programs the OS says are installed (inserted first so they win over heuristics).
+    for r in &inst.registered {
+        b.add(r.node, &r.name, &r.publisher, AppKind::Installed);
     }
 
-    // 2. System areas.
-    if let Some(w) = b.at(0, &["Windows"]) {
-        b.add(w, "Windows (OS)", "Microsoft", AppKind::System);
-    }
-    for (name, label) in [
-        ("$Recycle.Bin", "Recycle Bin"),
-        ("System Volume Information", "System Restore / VSS"),
-        ("Windows.old", "Previous Windows (Windows.old)"),
-        ("pagefile.sys", "Windows swap & hibernation"),
-        ("hiberfil.sys", "Windows swap & hibernation"),
-        ("swapfile.sys", "Windows swap & hibernation"),
-        ("Recovery", "Windows Recovery"),
-    ] {
-        if let Some(x) = b.at(0, &[name]) {
-            b.add(x, label, "Microsoft", AppKind::System);
-        }
-    }
+    // 2. The platform's own areas.
+    platform.app_roots(&mut b, inst);
 
-    // 3. Program Files, ProgramData.
-    for pf in ["Program Files", "Program Files (x86)"] {
-        if let Some(c) = b.at(0, &[pf]) {
-            b.container(c, AppKind::Folder, &["windowsapps", "common files", "modifiablewindowsapps"]);
-            if let Some(wa) = b.at(c, &["WindowsApps"]) {
-                b.container(wa, AppKind::Folder, &["deleted", "mutablepackagestorage"]);
-            }
-            if let Some(cf) = b.at(c, &["Common Files"]) {
-                b.add(cf, &format!("{pf} Common Files"), "", AppKind::Folder);
-            }
-        }
-    }
-    if let Some(pd) = b.at(0, &["ProgramData"]) {
-        b.container(pd, AppKind::Folder, &["package cache"]);
-        if let Some(pc) = b.at(pd, &["Package Cache"]) {
-            b.add(pc, "Installer package cache", "", AppKind::System);
-        }
-    }
-
-    // 4. User profiles.
-    if let Some(users) = b.at(0, &["Users"]) {
-        for u in b.dirs(users) {
-            let uname = tree.name(u).to_string();
-            if matches!(uname.to_lowercase().as_str(), "all users" | "default user" | "default" | "public") {
-                continue;
-            }
-            for sub in ["Local", "Roaming", "LocalLow"] {
-                if let Some(c) = b.at(u, &["AppData", sub]) {
-                    if sub == "Local" {
-                        if let Some(p) = b.at(c, &["Programs"]) {
-                            b.container(p, AppKind::Folder, &[]);
-                        }
-                        if let Some(p) = b.at(c, &["Packages"]) {
-                            b.container(p, AppKind::Folder, &[]);
-                        }
-                        if let Some(t) = b.at(c, &["Temp"]) {
-                            b.add(t, "User temp files", "", AppKind::System);
-                        }
-                    }
-                    b.container(c, AppKind::Folder, &["temp", "packages", "programs"]);
-                }
-            }
-            for d in b.dirs(u) {
-                let name = tree.name(d).to_string();
-                let lc = name.to_lowercase();
-                if name.starts_with('.') && name.len() > 1 {
-                    b.add(d, &name, "", AppKind::Folder);
-                } else if matches!(
-                    lc.as_str(),
-                    "desktop" | "documents" | "downloads" | "pictures" | "videos" | "music" | "source" | "projects"
-                ) || lc.starts_with("onedrive")
-                {
-                    b.add(d, &format!("{name} ({uname})"), &uname, AppKind::UserData);
-                }
-            }
-        }
-    }
-
-    // 5. Game libraries anywhere on the drive: steamapps\common\<game>, Epic Games\<game>.
+    // 3. Game libraries anywhere on the disk: steamapps/common/<game>, Epic Games/<game>.
     for id in 1..n as u32 {
         let nd = tree.node(id);
         if !nd.is_dir() || nd.flags & flag::DELETED != 0 {

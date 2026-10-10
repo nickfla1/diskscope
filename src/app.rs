@@ -1,50 +1,30 @@
-//! egui front-end.
+//! egui front-end: painting and UI state only.
 //!
-//! Everything heavy runs off the UI thread (scan, analysis, treemap rendering, hashing, trashing) and
-//! reports back through an `mpsc` channel of [`Event`]s. The UI thread only ever reads the shared tree
-//! under a short `RwLock` read guard and paints pre-rendered data, so it stays at full frame rate
-//! while a multi-million file scan is running.
+//! Everything else (scan, analysis, treemap rendering, hashing, deletion, the epoch and the derived
+//! lists) lives in [`Session`], which the CLI uses too. The UI thread reads the shared tree through a
+//! short-lived [`Snapshot`] and paints pre-rendered data, so it stays at full frame rate while a
+//! multi-million file scan is running.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
-use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
 use eframe::egui::{
     self, Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, Ui, pos2, vec2,
 };
 
-use crate::analysis::{self, Analysis, Cluster};
+use crate::analysis::Analysis;
 use crate::apps::AppKind;
 use crate::cleanup::Risk;
-use crate::deletion;
-use crate::dupes::{self, DupGroup, DupProgress};
+use crate::deletion::{self, Remover};
 use crate::model::{CAT_COLORS, CAT_NAMES, Tree, fmt_count, fmt_size, now_unix};
-use crate::scan::{self, Progress};
-use crate::treemap::{self, ColorMode, ColorSource, Rendered, app_color};
+use crate::session::{Change, Session, Snapshot};
+use crate::treemap::{self, ColorMode, app_color};
+use crate::views::{CleanupFilter, DupRow, LeftoverFilter};
 
 const ROW_H: f32 = 20.0;
 const ROW_H2: f32 = 38.0;
-
-enum Event {
-    Scanned(Result<Tree, String>),
-    Analyzed(u64, Analysis),
-    Treemap(RenderKey, Option<Arc<Rendered>>),
-    Dups(Vec<DupGroup>),
-    Removed(u32),
-    TrashDone { ok: usize, failed: Vec<(String, String)>, permanent: bool, cancelled: bool },
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct RenderKey {
-    root: u32,
-    w: usize,
-    h: usize,
-    mode: ColorMode,
-    epoch: u64,
-}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -79,12 +59,6 @@ enum Action {
     Trash(Vec<u32>),
 }
 
-#[derive(Clone)]
-struct Data {
-    tree: Arc<RwLock<Tree>>,
-    an: Arc<Analysis>,
-}
-
 struct DriveInfo {
     mount: String,
     label: String,
@@ -92,43 +66,15 @@ struct DriveInfo {
     free: u64,
 }
 
-struct ScanJob {
-    progress: Arc<Progress>,
-    cancel: Arc<AtomicBool>,
-    started: Instant,
-}
-
-struct DupJob {
-    progress: Arc<DupProgress>,
-    cancel: Arc<AtomicBool>,
-}
-
-pub struct TrashProgress {
-    done: AtomicU64,
-    total: AtomicU64,
-    current: std::sync::Mutex<String>,
-    cancel: AtomicBool,
-    permanent: bool,
-}
-
-enum DupRow {
-    Header(usize),
-    File(u32),
-}
-
+/// The uploaded treemap texture (the pixels themselves live in the session).
 #[derive(Default)]
 struct TreemapState {
     texture: Option<egui::TextureHandle>,
-    rendered: Option<Arc<Rendered>>,
-    requested: Option<RenderKey>,
-    counter: Arc<AtomicU64>,
 }
 
 pub struct App {
-    rt: tokio::runtime::Handle,
+    session: Session,
     ctx: egui::Context,
-    tx: Sender<Event>,
-    rx: Receiver<Event>,
 
     drives: Vec<DriveInfo>,
     path_input: String,
@@ -136,53 +82,33 @@ pub struct App {
     color_mode: ColorMode,
     tab: Tab,
 
-    scanning: Option<ScanJob>,
-    last_scan: Option<Duration>,
-    analyzing: bool,
-    error: Option<String>,
-    notice: Option<String>,
-
-    data: Option<Data>,
-    tree_gen: u64,
-    epoch: u64,
-
     tm: TreemapState,
     treemap_root: u32,
     selected: Option<u32>,
     hover: Option<u32>,
 
-    // folder tree
+    // folder tree (rebuilt whenever the session epoch changes)
     expanded: HashSet<u32>,
     rows: Vec<(u32, u16)>,
     rows_dirty: bool,
+    rows_epoch: u64,
     sorted: HashMap<u32, Vec<u32>>,
     pending_scroll: Option<u32>,
 
     // clusters
     cluster_mb: f64,
-    cluster_key: Option<(u64, u64)>,
-    clusters: Vec<Cluster>,
 
-    // cleanup
+    // cleanup filters
     cleanup_min_mb: f64,
     show_risk: [bool; 3],
-    /// 0 = all suggestions, 1 = only uninstall leftovers, 2 = hide uninstall leftovers
-    leftover_filter: u8,
-    cleanup_key: Option<(u64, u64, [bool; 3], u32, u8)>,
-    cleanup_view: Vec<usize>,
+    leftover_filter: LeftoverFilter,
+    show_cat: u32,
     checked: HashSet<u32>,
     pending_trash: Option<deletion::Plan>,
-    trashing: bool,
-    trash_job: Option<Arc<TrashProgress>>,
     delete_permanent: bool,
-    show_cat: u32,
 
     // duplicates
     dup_min_mb: f64,
-    dup_job: Option<DupJob>,
-    dup_groups: Vec<DupGroup>,
-    dup_rows: Vec<DupRow>,
-    dups_done: bool,
     shot: Option<Shot>,
 }
 
@@ -255,27 +181,18 @@ fn chip(ui: &Ui, rect: Rect, color: Color32) {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, rt: tokio::runtime::Handle) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
-        let (tx, rx) = channel();
-        let drives = list_drives();
-        let path_input = drives.iter().find(|d| d.mount.starts_with("C:")).or(drives.first()).map_or("C:\\".into(), |d| d.mount.clone());
+        let ctx = cc.egui_ctx.clone();
+        let wake_ctx = ctx.clone();
+        let session = Session::new(rt, crate::platform::current(), Arc::new(move || wake_ctx.request_repaint()));
+        let path_input = session.platform().default_root();
         App {
-            rt,
-            ctx: cc.egui_ctx.clone(),
-            tx,
-            rx,
-            drives,
+            session,
+            ctx,
+            drives: list_drives(),
             path_input,
             on_disk: true,
             color_mode: ColorMode::Type,
             tab: Tab::Folders,
-            scanning: None,
-            last_scan: None,
-            analyzing: false,
-            error: None,
-            notice: None,
-            data: None,
-            tree_gen: 0,
-            epoch: 0,
             tm: TreemapState::default(),
             treemap_root: 0,
             selected: None,
@@ -283,239 +200,75 @@ impl App {
             expanded: HashSet::new(),
             rows: Vec::new(),
             rows_dirty: true,
+            rows_epoch: 0,
             sorted: HashMap::new(),
             pending_scroll: None,
             cluster_mb: 256.0,
-            cluster_key: None,
-            clusters: Vec::new(),
             cleanup_min_mb: 1.0,
             show_risk: [true, true, true],
-            leftover_filter: 0,
-            cleanup_key: None,
-            cleanup_view: Vec::new(),
+            leftover_filter: LeftoverFilter::All,
+            show_cat: u32::MAX,
             checked: HashSet::new(),
             pending_trash: None,
-            trashing: false,
-            trash_job: None,
             delete_permanent: false,
-            show_cat: u32::MAX,
             dup_min_mb: 4.0,
-            dup_job: None,
-            dup_groups: Vec::new(),
-            dup_rows: Vec::new(),
-            dups_done: false,
             shot: None,
         }
     }
 
-    // ---------------------------------------------------------------- background work
-
-    fn send(tx: &Sender<Event>, ctx: &egui::Context, ev: Event) {
-        let _ = tx.send(ev);
-        ctx.request_repaint();
-    }
+    // ---------------------------------------------------------------- session glue
 
     fn start_scan(&mut self) {
-        if self.scanning.is_some() {
+        if self.session.is_scanning() {
             return;
         }
-        let path = PathBuf::from(self.path_input.trim());
-        let progress = Arc::new(Progress::default());
-        let cancel = Arc::new(AtomicBool::new(false));
-        self.scanning = Some(ScanJob { progress: progress.clone(), cancel: cancel.clone(), started: Instant::now() });
-        self.error = None;
-        self.notice = None;
-        self.data = None;
         self.tm = TreemapState::default();
-        self.dup_groups.clear();
-        self.dup_rows.clear();
-        self.dups_done = false;
         self.checked.clear();
         self.selected = None;
+        self.hover = None;
         self.treemap_root = 0;
-        let (tx, ctx, on_disk) = (self.tx.clone(), self.ctx.clone(), self.on_disk);
-        self.rt.spawn(async move {
-            let res = scan::scan(path, crate::dirreader::system(on_disk), progress, cancel).await;
-            Self::send(&tx, &ctx, Event::Scanned(res));
-        });
+        self.session.start_scan(PathBuf::from(self.path_input.trim()), self.on_disk);
     }
 
-    fn spawn_analysis(&mut self) {
-        let Some(d) = &self.data else { return };
-        let tree = d.tree.clone();
-        let (tx, ctx, g) = (self.tx.clone(), self.ctx.clone(), self.tree_gen);
-        self.analyzing = true;
-        self.rt.spawn_blocking(move || {
-            let a = analysis::analyze(&tree.read().unwrap());
-            Self::send(&tx, &ctx, Event::Analyzed(g, a));
-        });
+    fn remover(permanent: bool) -> Arc<dyn Remover> {
+        if permanent { Arc::new(deletion::Permanent) } else { Arc::new(deletion::SystemTrash) }
     }
 
-    fn request_render(&mut self, w: usize, h: usize) {
-        let Some(d) = self.data.clone() else { return };
-        let key = RenderKey { root: self.treemap_root, w, h, mode: self.color_mode, epoch: self.epoch };
-        if self.tm.requested == Some(key) || w < 8 || h < 8 {
-            return;
-        }
-        self.tm.requested = Some(key);
-        let counter = self.tm.counter.clone();
-        let generation = counter.fetch_add(1, Relaxed) + 1; // supersedes any render still in flight
-        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
-        self.rt.spawn_blocking(move || {
-            let r = {
-                let t = d.tree.read().unwrap();
-                let cs = ColorSource { mode: key.mode, app_of: &d.an.app_of, risk_of: &d.an.risk_of };
-                treemap::render(&t, key.root, key.w, key.h, &cs, &counter, generation)
-            };
-            Self::send(&tx, &ctx, Event::Treemap(key, r.map(Arc::new)));
-        });
-    }
-
-    fn start_dups(&mut self) {
-        let Some(d) = self.data.clone() else { return };
-        let progress = Arc::new(DupProgress::default());
-        let cancel = Arc::new(AtomicBool::new(false));
-        self.dup_job = Some(DupJob { progress: progress.clone(), cancel: cancel.clone() });
-        self.dup_groups.clear();
-        self.dup_rows.clear();
-        self.dups_done = false;
-        let min = (self.dup_min_mb * 1048576.0) as u64;
-        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
-        self.rt.spawn_blocking(move || {
-            let g = dupes::find(&d.tree, min, &progress, &cancel);
-            Self::send(&tx, &ctx, Event::Dups(g));
-        });
-    }
-
-    fn trash(&mut self, plan: deletion::Plan, permanent: bool) {
-        let Some(d) = self.data.clone() else { return };
-        self.trashing = true;
-        let job = Arc::new(TrashProgress {
-            done: AtomicU64::new(0),
-            total: AtomicU64::new(0),
-            current: std::sync::Mutex::new(String::new()),
-            cancel: AtomicBool::new(false),
-            permanent,
-        });
-        self.trash_job = Some(job.clone());
-        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
-        self.rt.spawn_blocking(move || {
-            let remover: Box<dyn deletion::Remover> =
-                if permanent { Box::new(deletion::Permanent) } else { Box::new(deletion::RecycleBin) };
-            let out = deletion::run(&d.tree, plan, &*remover, &job.cancel, &mut |p| match p {
-                deletion::Progress::Started { total } => job.total.store(total as u64, Relaxed),
-                deletion::Progress::Working { path } => *job.current.lock().unwrap() = path.to_string(),
-                deletion::Progress::Removed { id } => {
-                    job.done.fetch_add(1, Relaxed);
-                    Self::send(&tx, &ctx, Event::Removed(id));
-                }
-                deletion::Progress::Failed { .. } => {
-                    job.done.fetch_add(1, Relaxed);
-                }
-            });
-            Self::send(&tx, &ctx, Event::TrashDone { ok: out.ok, failed: out.failed, permanent: out.permanent, cancelled: out.cancelled });
-        });
-    }
-
+    /// Apply what the session reports to the UI state.
     fn poll(&mut self) {
-        while let Ok(ev) = self.rx.try_recv() {
-            match ev {
-                Event::Scanned(res) => {
-                    let job = self.scanning.take();
-                    self.last_scan = job.map(|j| j.started.elapsed());
-                    match res {
-                        Ok(tree) => {
-                            self.tree_gen += 1;
-                            self.epoch += 1;
-                            self.expanded = HashSet::from([0]);
-                            self.sorted.clear();
-                            self.rows_dirty = true;
-                            self.cluster_key = None;
-                            self.cleanup_key = None;
-                            let total = tree.nodes[0].size;
-                            self.cluster_mb = ((total / 200).max(64 << 20) as f64 / 1048576.0).round();
-                            self.data = Some(Data { tree: Arc::new(RwLock::new(tree)), an: Arc::new(Analysis::default()) });
-                            self.spawn_analysis();
-                        }
-                        Err(e) if e == "cancelled" => {}
-                        Err(e) => self.error = Some(e),
+        for change in self.session.poll() {
+            match change {
+                Change::ScanFinished { ok: true } => {
+                    self.expanded = HashSet::from([0]);
+                    if let Some(d) = self.session.data() {
+                        let total = d.read().tree().node(0).size;
+                        self.cluster_mb = ((total / 200).max(64 << 20) as f64 / 1048576.0).round();
                     }
                 }
-                Event::Analyzed(g, a) => {
-                    if g == self.tree_gen {
-                        if let Some(d) = &mut self.data {
-                            d.an = Arc::new(a);
-                        }
-                        self.analyzing = false;
-                        self.epoch += 1;
-                        self.cluster_key = None;
-                        self.cleanup_key = None;
-                    }
-                }
-                Event::Treemap(key, r) => {
-                    if self.tm.requested == Some(key) {
-                        if let Some(r) = r {
-                            let img = egui::ColorImage::from_rgba_unmultiplied([r.w, r.h], &r.rgba);
-                            let opts = egui::TextureOptions::NEAREST;
-                            match &mut self.tm.texture {
-                                Some(t) => t.set(img, opts),
-                                None => self.tm.texture = Some(self.ctx.load_texture("treemap", img, opts)),
-                            }
-                            self.tm.rendered = Some(r);
-                        }
-                    }
-                }
-                Event::Dups(g) => {
-                    self.dup_job = None;
-                    self.dups_done = true;
-                    self.dup_groups = g;
-                    self.rebuild_dup_rows();
-                }
-                Event::Removed(id) => {
-                    // the tree was already updated by `deletion::run`; only UI state is reset here
+                Change::Removed(id) => {
                     self.checked.remove(&id);
                     if self.selected == Some(id) {
                         self.selected = None;
                     }
-                    self.epoch += 1;
-                    self.sorted.clear();
-                    self.rows_dirty = true;
-                    self.cluster_key = None;
-                    self.cleanup_key = None;
                 }
-                Event::TrashDone { ok, failed, permanent, cancelled } => {
-                    self.trashing = false;
-                    self.trash_job = None;
-                    if ok > 0 {
-                        self.tree_gen += 1;
-                        if let Some(d) = self.data.clone() {
-                            let t = d.tree.read().unwrap();
-                            self.dup_groups.retain_mut(|g| {
-                                g.nodes.retain(|&n| !t.is_gone(n));
-                                g.nodes.len() > 1
-                            });
+                Change::RenderReady => {
+                    if let Some(r) = self.session.rendered() {
+                        let img = egui::ColorImage::from_rgba_unmultiplied([r.w, r.h], &r.rgba);
+                        let opts = egui::TextureOptions::NEAREST;
+                        match &mut self.tm.texture {
+                            Some(t) => t.set(img, opts),
+                            None => self.tm.texture = Some(self.ctx.load_texture("treemap", img, opts)),
                         }
-                        self.rebuild_dup_rows();
-                        self.spawn_analysis();
                     }
-                    let verb = if permanent { "Permanently deleted" } else { "Moved to the Recycle Bin:" };
-                    self.notice = Some(match (failed.first(), cancelled) {
-                        (None, false) => format!("{verb} {ok} item(s)."),
-                        (None, true) => format!("{verb} {ok} item(s); cancelled."),
-                        (Some(f), _) => format!("{verb} {ok} item(s); {} failed (first: {} - {}).", failed.len(), f.0, f.1),
-                    });
                 }
+                Change::ScanFinished { ok: false } | Change::AnalysisReady | Change::DupsReady | Change::DeleteFinished => {}
             }
         }
-    }
-
-    fn rebuild_dup_rows(&mut self) {
-        self.dup_rows.clear();
-        for (gi, g) in self.dup_groups.iter().enumerate() {
-            self.dup_rows.push(DupRow::Header(gi));
-            for &n in &g.nodes {
-                self.dup_rows.push(DupRow::File(n));
-            }
+        // The folder list is a pure function of the tree, so it follows the session epoch.
+        if self.rows_epoch != self.session.epoch() {
+            self.rows_epoch = self.session.epoch();
+            self.sorted.clear();
+            self.rows_dirty = true;
         }
     }
 
@@ -557,7 +310,8 @@ impl App {
         if t.node(id).is_dir() { id } else { t.node(id).parent }
     }
 
-    fn apply(&mut self, t: &Tree, actions: Vec<Action>) {
+    fn apply(&mut self, snap: &Snapshot<'_>, actions: Vec<Action>) {
+        let t = snap.tree();
         for a in actions {
             match a {
                 Action::Select(id) => self.select(t, id),
@@ -566,21 +320,10 @@ impl App {
                     self.treemap_root = Self::zoom_target(t, id);
                 }
                 Action::Zoom(id) => self.treemap_root = id,
-                Action::Reveal(id) => {
-                    #[cfg(windows)]
-                    {
-                        use std::os::windows::process::CommandExt;
-                        let _ = std::process::Command::new("explorer")
-                            .raw_arg(format!("/select,\"{}\"", t.path(id)))
-                            .spawn();
-                    }
-                    #[cfg(not(windows))]
-                    let _ = id;
-                }
+                Action::Reveal(id) => self.session.platform().reveal(&t.path(id)),
                 Action::CopyPath(id) => self.ctx.copy_text(t.path(id)),
                 Action::Trash(ids) => {
-                    let risk = self.data.as_ref().map(|d| d.an.clone());
-                    let plan = deletion::plan(t, &ids, risk.as_ref().map_or(&[][..], |a| &a.risk_of[..]));
+                    let plan = self.session.plan(snap, &ids);
                     if !plan.items.is_empty() || !plan.refused.is_empty() {
                         self.pending_trash = Some(plan);
                     }
@@ -594,7 +337,7 @@ impl App {
             actions.push(Action::Zoom(id));
             ui.close();
         }
-        if ui.button("Show in Explorer").clicked() {
+        if ui.button("Show in file manager").clicked() {
             actions.push(Action::Reveal(id));
             ui.close();
         }
@@ -632,12 +375,10 @@ impl App {
                     self.path_input = p.to_string_lossy().to_string();
                 }
             }
-            let scanning = self.scanning.is_some();
+            let scanning = self.session.is_scanning();
             if scanning {
                 if ui.button("Stop").clicked() {
-                    if let Some(j) = &self.scanning {
-                        j.cancel.store(true, Relaxed);
-                    }
+                    self.session.cancel_scan();
                 }
             } else if ui.button(egui::RichText::new("Scan").strong()).clicked()
                 || (te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
@@ -657,44 +398,43 @@ impl App {
 
     fn status_bar(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
-            if let Some(j) = self.trash_job.clone() {
-                let (done, total) = (j.done.load(Relaxed), j.total.load(Relaxed));
-                let cur = j.current.lock().unwrap().clone();
-                let verb = if j.permanent { "Deleting" } else { "Recycling" };
+            if let Some(st) = self.session.delete_status() {
+                let verb = if st.permanent { "Deleting" } else { "Trashing" };
                 ui.add(
-                    egui::ProgressBar::new(if total > 0 { done as f32 / total as f32 } else { 0.0 })
+                    egui::ProgressBar::new(if st.total > 0 { st.done as f32 / st.total as f32 } else { 0.0 })
                         .desired_width(260.0)
-                        .text(format!("{verb} {done}/{total}")),
+                        .text(format!("{verb} {}/{}", st.done, st.total)),
                 );
                 if ui.small_button("Stop").clicked() {
-                    j.cancel.store(true, Relaxed);
+                    self.session.cancel_delete();
                 }
-                ui.add(egui::Label::new(egui::RichText::new(cur).weak().size(11.5)).truncate());
+                ui.add(egui::Label::new(egui::RichText::new(st.current).weak().size(11.5)).truncate());
                 ui.ctx().request_repaint_after(Duration::from_millis(100));
                 return;
             }
-            if let Some(j) = &self.scanning {
+            if let Some(st) = self.session.scan_status() {
                 ui.spinner();
                 ui.label(format!(
                     "Scanning... {} files, {} folders, {}  -  {:.0}s{}",
-                    fmt_count(j.progress.files.load(Relaxed)),
-                    fmt_count(j.progress.dirs.load(Relaxed)),
-                    fmt_size(j.progress.bytes.load(Relaxed)),
-                    j.started.elapsed().as_secs_f32(),
-                    match j.progress.errors.load(Relaxed) {
+                    fmt_count(st.files),
+                    fmt_count(st.dirs),
+                    fmt_size(st.bytes),
+                    st.elapsed.as_secs_f32(),
+                    match st.errors {
                         0 => String::new(),
                         n => format!("  ({n} unreadable)"),
                     }
                 ));
                 ui.ctx().request_repaint_after(Duration::from_millis(100));
-            } else if let Some(d) = &self.data {
-                let t = d.tree.read().unwrap();
+            } else if let Some(d) = self.session.data() {
+                let snap = d.read();
+                let t = snap.tree();
                 let n = t.node(0);
                 ui.label(format!("{}  -  {} files  -  {}", t.root_path, fmt_count(n.files as u64), fmt_size(n.size)));
-                if let Some(s) = self.last_scan {
-                    ui.weak(format!("scanned in {:.1}s", s.as_secs_f32()));
+                if let Some(s) = self.session.last_scan() {
+                    ui.weak(format!("scanned in {:.1}s", s.elapsed.as_secs_f32()));
                 }
-                if self.analyzing {
+                if self.session.is_analyzing() {
                     ui.spinner();
                     ui.weak("analysing...");
                     ui.ctx().request_repaint_after(Duration::from_millis(100));
@@ -706,18 +446,19 @@ impl App {
             } else {
                 ui.weak("Choose a drive or folder and press Scan.");
             }
-            if let Some(n) = &self.notice {
+            if let Some(n) = &self.session.notice {
                 ui.separator();
                 ui.colored_label(Color32::from_rgb(120, 200, 140), n);
             }
-            if let Some(e) = &self.error {
+            if let Some(e) = &self.session.error {
                 ui.separator();
                 ui.colored_label(Color32::from_rgb(230, 100, 100), e);
             }
         });
     }
 
-    fn tabs_ui(&mut self, ui: &mut Ui, t: &Tree, an: &Analysis, actions: &mut Vec<Action>) {
+    fn tabs_ui(&mut self, ui: &mut Ui, snap: &Snapshot<'_>, actions: &mut Vec<Action>) {
+        let (t, an) = (snap.tree(), snap.analysis());
         ui.horizontal_wrapped(|ui| {
             for (tab, name) in Tab::ALL {
                 ui.selectable_value(&mut self.tab, tab, name);
@@ -727,9 +468,9 @@ impl App {
         match self.tab {
             Tab::Folders => self.tab_folders(ui, t, actions),
             Tab::Apps => self.tab_apps(ui, t, an, actions),
-            Tab::Clusters => self.tab_clusters(ui, t, an, actions),
-            Tab::Cleanup => self.tab_cleanup(ui, t, an, actions),
-            Tab::Duplicates => self.tab_dups(ui, t, actions),
+            Tab::Clusters => self.tab_clusters(ui, snap, actions),
+            Tab::Cleanup => self.tab_cleanup(ui, snap, actions),
+            Tab::Duplicates => self.tab_dups(ui, snap, actions),
             Tab::Types => self.tab_types(ui, t, an),
             Tab::Large => self.tab_large(ui, t, an, actions),
         }
@@ -817,14 +558,14 @@ impl App {
     }
 
     fn tab_apps(&mut self, ui: &mut Ui, t: &Tree, an: &Analysis, actions: &mut Vec<Action>) {
-        if self.analyzing && an.apps.is_empty() {
+        if self.session.is_analyzing() && an.apps.is_empty() {
             ui.horizontal(|ui| {
                 ui.spinner();
                 ui.label("Detecting applications...");
             });
             return;
         }
-        ui.weak("Folders are attributed to applications via the installed-programs registry, Program Files, ProgramData, AppData, game libraries and user folders.");
+        ui.weak("Folders are attributed to applications using the system's list of installed programs, well-known application folders, game libraries and user folders.");
         let total = t.node(0).size.max(1);
         egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, ROW_H2, an.apps.len(), |ui, range| {
             for i in range {
@@ -858,22 +599,19 @@ impl App {
         });
     }
 
-    fn tab_clusters(&mut self, ui: &mut Ui, t: &Tree, an: &Analysis, actions: &mut Vec<Action>) {
+    fn tab_clusters(&mut self, ui: &mut Ui, snap: &Snapshot<'_>, actions: &mut Vec<Action>) {
+        let (t, an) = (snap.tree(), snap.analysis());
         ui.horizontal(|ui| {
             ui.label("Cluster threshold");
             ui.add(egui::DragValue::new(&mut self.cluster_mb).range(1.0..=1_000_000.0).speed(8.0).suffix(" MiB"));
         });
         ui.weak("Large clusters are where space concentrates: the deepest folders of at least the threshold size, plus loose files sitting beside big sub-folders. They never overlap.");
-        let key = (self.epoch, self.cluster_mb as u64);
-        if self.cluster_key != Some(key) {
-            self.clusters = analysis::find_clusters(t, (self.cluster_mb * 1048576.0) as u64, &an.app_of);
-            self.cluster_key = Some(key);
-        }
         let total = t.node(0).size.max(1);
-        ui.label(format!("{} clusters, covering {}", self.clusters.len(), fmt_size(self.clusters.iter().map(|c| c.size).sum())));
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, ROW_H2, self.clusters.len(), |ui, range| {
+        let clusters = self.session.clusters(snap, (self.cluster_mb * 1048576.0) as u64);
+        ui.label(format!("{} clusters, covering {}", clusters.len(), fmt_size(clusters.iter().map(|c| c.size).sum())));
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, ROW_H2, clusters.len(), |ui, range| {
             for i in range {
-                let c = &self.clusters[i];
+                let c = &clusters[i];
                 let (rect, resp) = row(ui, ROW_H2, self.selected == Some(c.node));
                 let right = rect.right() - 6.0;
                 let frac = c.size as f32 / total as f32;
@@ -900,8 +638,9 @@ impl App {
         });
     }
 
-    fn tab_cleanup(&mut self, ui: &mut Ui, t: &Tree, an: &Analysis, actions: &mut Vec<Action>) {
-        if self.analyzing && an.suggestions.is_empty() {
+    fn tab_cleanup(&mut self, ui: &mut Ui, snap: &Snapshot<'_>, actions: &mut Vec<Action>) {
+        let (t, an) = (snap.tree(), snap.analysis());
+        if self.session.is_analyzing() && an.suggestions.is_empty() {
             ui.horizontal(|ui| {
                 ui.spinner();
                 ui.label("Looking for deletable files...");
@@ -934,12 +673,12 @@ impl App {
             egui::ComboBox::from_id_salt("leftovers")
                 .selected_text(["All suggestions", "Only uninstall leftovers", "Hide uninstall leftovers"][self.leftover_filter as usize])
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.leftover_filter, 0, "All suggestions");
-                    ui.selectable_value(&mut self.leftover_filter, 1, "Only uninstall leftovers");
-                    ui.selectable_value(&mut self.leftover_filter, 2, "Hide uninstall leftovers");
+                    ui.selectable_value(&mut self.leftover_filter, LeftoverFilter::All, "All suggestions");
+                    ui.selectable_value(&mut self.leftover_filter, LeftoverFilter::Only, "Only uninstall leftovers");
+                    ui.selectable_value(&mut self.leftover_filter, LeftoverFilter::Hide, "Hide uninstall leftovers");
                 })
                 .response
-                .on_hover_text("Folders left behind by uninstalled programs: Program Files folders with no program in them, and data of Store apps that are no longer installed.");
+                .on_hover_text("Folders left behind by uninstalled programs (for example Program Files folders with nothing runnable in them, or data of Store apps that are no longer installed on Windows).");
         });
         ui.horizontal_wrapped(|ui| {
             ui.label("Types:");
@@ -954,21 +693,17 @@ impl App {
                 self.show_cat = u32::MAX;
             }
         });
-        let key = (self.epoch, (self.cleanup_min_mb * 1024.0) as u64, self.show_risk, self.show_cat, self.leftover_filter);
-        if self.cleanup_key != Some(key) {
-            let min = (self.cleanup_min_mb * 1048576.0) as u64;
-            self.cleanup_view = an
-                .suggestions
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| s.size >= min && (self.leftover_filter == 0 || (self.leftover_filter == 1) == s.leftover) && self.show_risk[s.risk as usize - 1] && self.show_cat >> t.node(s.node).cat & 1 == 1 && !t.is_gone(s.node))
-                .map(|(i, _)| i)
-                .collect();
-            self.cleanup_key = Some(key);
-        }
+        let deleting = self.session.is_deleting();
+        let filter = CleanupFilter {
+            min_bytes: (self.cleanup_min_mb * 1048576.0) as u64,
+            risk: self.show_risk,
+            cats: self.show_cat,
+            leftovers: self.leftover_filter,
+        };
+        let view = self.session.cleanup(snap, &filter);
         ui.horizontal_wrapped(|ui| {
             if ui.button("Check all Safe").clicked() {
-                for &i in &self.cleanup_view {
+                for &i in view {
                     if an.suggestions[i].risk == Risk::Safe {
                         self.checked.insert(an.suggestions[i].node);
                     }
@@ -979,13 +714,13 @@ impl App {
             }
             let sel: Vec<u32> = self.checked.iter().copied().filter(|&n| !t.is_gone(n)).collect();
             let sel_size: u64 = sel.iter().map(|&n| t.node(n).size).sum();
-            if ui.add_enabled(!sel.is_empty() && !self.trashing, egui::Button::new(format!("Delete {} checked ({}) ...", sel.len(), fmt_size(sel_size)))).clicked() {
+            if ui.add_enabled(!sel.is_empty() && !deleting, egui::Button::new(format!("Delete {} checked ({}) ...", sel.len(), fmt_size(sel_size)))).clicked() {
                 actions.push(Action::Trash(sel));
             }
         });
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, ROW_H2, self.cleanup_view.len(), |ui, range| {
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, ROW_H2, view.len(), |ui, range| {
             for i in range {
-                let s = &an.suggestions[self.cleanup_view[i]];
+                let s = &an.suggestions[view[i]];
                 let (rect, resp) = row(ui, ROW_H2, self.selected == Some(s.node));
                 let right = rect.right() - 6.0;
                 let cb = Rect::from_min_size(pos2(rect.left() + 6.0, rect.center().y - 7.0), vec2(14.0, 14.0));
@@ -1017,42 +752,42 @@ impl App {
         });
     }
 
-    fn tab_dups(&mut self, ui: &mut Ui, t: &Tree, actions: &mut Vec<Action>) {
+    fn tab_dups(&mut self, ui: &mut Ui, snap: &Snapshot<'_>, actions: &mut Vec<Action>) {
+        let t = snap.tree();
+        let finding = self.session.is_finding_dups();
+        let deleting = self.session.is_deleting();
         ui.horizontal(|ui| {
             ui.label("Files at least");
-            ui.add_enabled(self.dup_job.is_none(), egui::DragValue::new(&mut self.dup_min_mb).range(0.1..=100_000.0).speed(0.5).suffix(" MiB"));
-            if self.dup_job.is_some() {
+            ui.add_enabled(!finding, egui::DragValue::new(&mut self.dup_min_mb).range(0.1..=100_000.0).speed(0.5).suffix(" MiB"));
+            if finding {
                 if ui.button("Cancel").clicked() {
-                    if let Some(j) = &self.dup_job {
-                        j.cancel.store(true, Relaxed);
-                    }
+                    self.session.cancel_dups();
                 }
             } else if ui.button("Find duplicates").clicked() {
-                self.start_dups();
+                self.session.start_dups((self.dup_min_mb * 1048576.0) as u64);
             }
         });
-        if let Some(j) = &self.dup_job {
-            let stage = j.progress.stage.load(Relaxed);
-            let (total, done) = (j.progress.total.load(Relaxed), j.progress.done.load(Relaxed));
-            let label = match stage {
+        if let Some(st) = self.session.dup_status() {
+            let label = match st.stage {
                 1 => "Grouping files by size...".to_string(),
-                2 => format!("Quick-hashing {done}/{total} candidates"),
-                3 => format!("Full-hashing {done}/{total} candidates"),
+                2 => format!("Quick-hashing {}/{} candidates", st.done, st.total),
+                3 => format!("Full-hashing {}/{} candidates", st.done, st.total),
                 _ => "Working...".to_string(),
             };
-            ui.add(egui::ProgressBar::new(if total > 0 { done as f32 / total as f32 } else { 0.0 }).text(label).animate(true));
+            ui.add(egui::ProgressBar::new(if st.total > 0 { st.done as f32 / st.total as f32 } else { 0.0 }).text(label).animate(true));
             ui.ctx().request_repaint_after(Duration::from_millis(100));
             return;
         }
-        if !self.dups_done {
-            ui.weak("Hashes (BLAKE3) only files that share an exact size, first a 64 KiB prefix and then the whole file, in parallel. System and Program Files paths are excluded (hard-linked copies are not real duplicates).");
+        if !self.session.dups_done() {
+            ui.weak("Hashes (BLAKE3) only files that share an exact size, first a 64 KiB prefix and then the whole file, in parallel. System and application paths are excluded (hard-linked copies are not real duplicates).");
             return;
         }
-        let wasted: u64 = self.dup_groups.iter().map(|g| g.wasted()).sum();
+        let (groups, rows) = self.session.dup_view();
+        let wasted: u64 = groups.iter().map(|g| g.wasted()).sum();
         ui.horizontal(|ui| {
-            ui.label(format!("{} groups, {} reclaimable", self.dup_groups.len(), fmt_size(wasted)));
+            ui.label(format!("{} groups, {} reclaimable", groups.len(), fmt_size(wasted)));
             if ui.button("Check all but oldest copy").clicked() {
-                for g in &self.dup_groups {
+                for g in groups {
                     let keep = g.nodes.iter().copied().min_by_key(|&n| t.node(n).mtime);
                     for &n in &g.nodes {
                         if Some(n) != keep {
@@ -1062,15 +797,15 @@ impl App {
                 }
             }
             let sel: Vec<u32> = self.checked.iter().copied().filter(|&n| !t.is_gone(n)).collect();
-            if ui.add_enabled(!sel.is_empty() && !self.trashing, egui::Button::new(format!("Delete {} checked...", sel.len()))).clicked() {
+            if ui.add_enabled(!sel.is_empty() && !deleting, egui::Button::new(format!("Delete {} checked...", sel.len()))).clicked() {
                 actions.push(Action::Trash(sel));
             }
         });
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, ROW_H, self.dup_rows.len(), |ui, range| {
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, ROW_H, rows.len(), |ui, range| {
             for i in range {
-                match self.dup_rows[i] {
+                match rows[i] {
                     DupRow::Header(gi) => {
-                        let g = &self.dup_groups[gi];
+                        let g = &groups[gi];
                         let (rect, _) = row(ui, ROW_H, false);
                         text(ui, pos2(rect.left() + 4.0, rect.center().y), Align2::LEFT_CENTER, format!("{} copies x {}  -  wastes {}", g.nodes.len(), fmt_size(g.size), fmt_size(g.wasted())), Color32::from_rgb(240, 200, 110));
                     }
@@ -1193,10 +928,10 @@ impl App {
         let (resp, painter) = ui.allocate_painter(avail, Sense::click());
         let rect = resp.rect;
         let ppp = ui.ctx().pixels_per_point();
-        self.request_render((rect.width() * ppp) as usize, (rect.height() * ppp) as usize);
+        self.session.request_render(self.treemap_root, (rect.width() * ppp) as usize, (rect.height() * ppp) as usize, self.color_mode);
 
-        let (Some(tex), Some(r)) = (&self.tm.texture, self.tm.rendered.clone()) else {
-            if self.tm.requested.is_some() {
+        let (Some(tex), Some(r)) = (&self.tm.texture, self.session.rendered()) else {
+            if self.session.render_requested() {
                 painter.text(rect.center(), Align2::CENTER_CENTER, "Rendering...", FontId::proportional(16.0), Color32::GRAY);
             }
             self.hover = None;
@@ -1318,17 +1053,17 @@ impl App {
                 }
                 if can_run {
                     ui.add_space(6.0);
-                    ui.checkbox(&mut self.delete_permanent, "Skip Recycle Bin (delete permanently)");
+                    ui.checkbox(&mut self.delete_permanent, format!("Skip {} (delete permanently)", self.session.platform().trash_name()));
                     if self.delete_permanent {
                         ui.colored_label(Color32::from_rgb(230, 100, 100), "Permanent deletion cannot be undone.");
                     } else {
-                        ui.weak("Items go to the Recycle Bin and can be restored, unless Windows decides they are too large for it.");
+                        ui.weak(self.session.platform().trash_note());
                     }
                 }
                 ui.add_space(6.0);
                 let perm = self.delete_permanent;
                 ui.horizontal(|ui| {
-                    if can_run && ui.button(if perm { "Delete permanently" } else { "Move to Recycle Bin" }).clicked() {
+                    if can_run && ui.button(if perm { "Delete permanently".to_string() } else { format!("Move to {}", self.session.platform().trash_name()) }).clicked() {
                         confirm = true;
                     }
                     if ui.button(if can_run { "Cancel" } else { "OK" }).clicked() {
@@ -1338,7 +1073,8 @@ impl App {
             });
         if confirm {
             if let Some(plan) = self.pending_trash.take() {
-                self.trash(plan, self.delete_permanent);
+                let remover = Self::remover(self.delete_permanent);
+                self.session.delete(plan, remover);
             }
         } else if close {
             self.pending_trash = None;
@@ -1355,24 +1091,23 @@ impl eframe::App for App {
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
 
-        let data = self.data.clone();
+        let data = self.session.data();
         let mut actions: Vec<Action> = Vec::new();
         if let Some(d) = &data {
-            let t = d.tree.read().unwrap();
-            let an = d.an.as_ref();
-            egui::Panel::left("tabs").resizable(true).default_size(560.0).min_size(380.0).show(ui, |ui| self.tabs_ui(ui, &t, an, &mut actions));
-            egui::CentralPanel::default().show(ui, |ui| self.treemap_ui(ui, &t, an, &mut actions));
+            let snap = d.read();
+            egui::Panel::left("tabs").resizable(true).default_size(560.0).min_size(380.0).show(ui, |ui| self.tabs_ui(ui, &snap, &mut actions));
+            egui::CentralPanel::default().show(ui, |ui| self.treemap_ui(ui, snap.tree(), snap.analysis(), &mut actions));
             self.trash_dialog(&ctx);
-            self.apply(&t, actions);
+            self.apply(&snap, actions);
         } else {
             egui::CentralPanel::default().show(ui, |ui| {
                 ui.centered_and_justified(|ui| {
-                    if let Some(j) = &self.scanning {
+                    if let Some(st) = self.session.scan_status() {
                         ui.vertical_centered(|ui| {
                             ui.add_space(ui.available_height() * 0.4);
                             ui.spinner();
-                            ui.heading(format!("{} files", fmt_count(j.progress.files.load(Relaxed))));
-                            ui.label(format!("{} in {} folders", fmt_size(j.progress.bytes.load(Relaxed)), fmt_count(j.progress.dirs.load(Relaxed))));
+                            ui.heading(format!("{} files", fmt_count(st.files)));
+                            ui.label(format!("{} in {} folders", fmt_size(st.bytes), fmt_count(st.dirs)));
                         });
                     } else {
                         ui.heading("DiskScope");
@@ -1404,10 +1139,7 @@ impl App {
     }
 
     fn drive_shot(&mut self, ctx: &egui::Context) {
-        let ready = self.data.is_some()
-            && !self.analyzing
-            && self.tm.rendered.is_some()
-            && self.tm.requested.is_some_and(|k| k.epoch == self.epoch);
+        let ready = self.session.data().is_some() && !self.session.is_analyzing() && self.session.render_is_current();
         let Some(s) = &mut self.shot else { return };
         ctx.request_repaint();
         if ready {

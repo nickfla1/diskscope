@@ -75,7 +75,7 @@ fn spawn_dir(sh: Arc<Shared>, id: u32, path: PathBuf) {
     });
 }
 
-/// Scan `root` through `reader` (use [`crate::dirreader::system`] for the real file system).
+/// Scan `root` through `reader` (use `platform::current().dir_reader(..)` for the real file system).
 pub async fn scan(
     root: PathBuf,
     reader: Arc<dyn DirReader>,
