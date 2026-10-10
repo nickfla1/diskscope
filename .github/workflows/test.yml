@@ -1,9 +1,14 @@
 name: Test
 
-# Runs whenever something lands on main (a merged pull request or a direct push), and on demand.
+# Runs when something lands on main (a merged pull request or a direct push) that changes the code or its
+# dependencies, and on demand. Docs-only and workflow-only pushes are skipped.
 on:
   push:
     branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
   workflow_dispatch:
 
 env:

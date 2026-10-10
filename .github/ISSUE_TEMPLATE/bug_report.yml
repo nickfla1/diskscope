@@ -1,0 +1,59 @@
+name: Bug report
+description: Something crashed, looks wrong, or behaves unexpectedly.
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time. For a wrong cleanup suggestion please use the *Wrong cleanup suggestion* form instead.
+        Please replace your user name in paths with `<user>`.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead. Screenshots are welcome.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Scan ...
+        2. Open the ... tab
+        3. ...
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows 11
+        - Windows 10
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: os_version
+    attributes:
+      label: OS version
+      placeholder: Windows 11 23H2 / macOS 14.5
+  - type: input
+    id: version
+    attributes:
+      label: DiskScope version
+      description: The release you downloaded, or the commit if you built from source.
+      placeholder: v0.1.0
+  - type: input
+    id: scan
+    attributes:
+      label: What did you scan, and how big was it?
+      description: 'For example "the whole C: drive, about 3 million files" or "my home folder".'
+  - type: textarea
+    id: output
+    attributes:
+      label: Error messages or output
+      description: Anything shown in the status bar, or printed if you ran `diskscope --cli`.
+      render: text

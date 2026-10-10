@@ -1,0 +1,72 @@
+name: Wrong cleanup suggestion
+description: DiskScope flagged something it should not have, graded it wrongly, or missed something that is clearly deletable.
+title: "[Cleanup] "
+labels: ["cleanup-rules"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The cleanup rules are heuristics, so reports like this are how they get better. Thank you!
+
+        **If deleting the item already broke something or lost data, please say so below** - that is the highest priority.
+        Please replace your user name in paths with `<user>`.
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What was wrong?
+      options:
+        - Flagged as Safe, but it is not safe to delete
+        - Flagged as Review or Caution, but it is actually safe
+        - A suggestion that should not be listed at all
+        - Something clearly deletable was not suggested
+        - A wrong "uninstall leftover"
+    validations:
+      required: true
+  - type: input
+    id: path
+    attributes:
+      label: Path
+      description: The full path of the file or folder.
+      placeholder: C:\Users\<user>\AppData\Local\SomeApp\Cache   or   /Users/<user>/Library/Caches/com.example.App
+    validations:
+      required: true
+  - type: input
+    id: shown
+    attributes:
+      label: Grade and reason DiskScope showed
+      description: The risk (Safe / Review / Caution) and the reason text, if it was listed.
+      placeholder: "Safe - Application / browser cache"
+  - type: textarea
+    id: what
+    attributes:
+      label: What is it, and what happens if it is deleted?
+      description: Which application owns it, whether it is recreated automatically, and anything you know about the consequences.
+    validations:
+      required: true
+  - type: dropdown
+    id: outcome
+    attributes:
+      label: Did you delete it?
+      options:
+        - No, I did not delete it
+        - Yes, and nothing went wrong
+        - Yes, and an application stopped working or lost data
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows 11
+        - Windows 10
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: DiskScope version
+      placeholder: v0.1.0
