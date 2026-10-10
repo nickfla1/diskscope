@@ -84,11 +84,19 @@ impl<'a> AppBuilder<'a> {
         self.tree.name(node)
     }
 
-    pub fn root_path(&self) -> &'a str {
-        &self.tree.root_path
+    /// The scanned root with `/` separators on every OS, so adapters can match it without caring
+    /// whether the host uses `\`.
+    #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))] // used by the macOS adapter
+    pub fn root_path(&self) -> String {
+        if std::path::MAIN_SEPARATOR == '/' {
+            self.tree.root_path.clone()
+        } else {
+            self.tree.root_path.replace(std::path::MAIN_SEPARATOR, "/")
+        }
     }
 
     /// Resolve a platform path within the scanned scope.
+    #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))] // used by the macOS adapter
     pub fn absolute(&self, path: &str) -> Option<u32> {
         self.tree.find(path)
     }

@@ -1,0 +1,46 @@
+name: Test
+
+# Runs whenever something lands on main (a merged pull request or a direct push), and on demand.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+# A newer push to main supersedes a run that is still going.
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false # a failure on one OS should not hide the result on the other
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # The release workflow builds a universal macOS binary, so catch Intel-only breakage here too.
+          targets: ${{ runner.os == 'macOS' && 'x86_64-apple-darwin' || '' }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build (release)
+        run: cargo build --release --locked
+
+      - name: Check the Intel macOS build
+        if: runner.os == 'macOS'
+        run: cargo check --locked --release --target x86_64-apple-darwin

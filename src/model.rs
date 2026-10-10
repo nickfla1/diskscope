@@ -173,7 +173,12 @@ impl Tree {
         if pl.len() < root.len() || !pl.is_char_boundary(root.len()) {
             return None;
         }
-        if !pl[..root.len()].eq_ignore_ascii_case(root) {
+        // case-insensitive, and `/` matches `\` on Windows (callers may build paths with either)
+        let same_prefix = pl[..root.len()]
+            .chars()
+            .zip(root.chars())
+            .all(|(a, b)| (is_sep(a) && is_sep(b)) || a.eq_ignore_ascii_case(&b));
+        if !same_prefix {
             return None;
         }
         let rest = &pl[root.len()..];

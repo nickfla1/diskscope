@@ -123,13 +123,24 @@ impl Platform for MacOs {
             .unwrap_or_default();
         // A home-folder (the default), Library, or Library-container scan still has the same
         // attribution anchors. Resolve only anchors that are inside the scanned scope.
-        let root = b.root_path().to_string();
-        let components: Vec<&str> = root.split('/').filter(|s| !s.is_empty()).collect();
-        if let Some(i) = components.iter().rposition(|s| s.eq_ignore_ascii_case("Users"))
-            && let Some(uname) = components.get(i + 1) {
-                let home = format!("/{}", components[..i + 2].join("/"));
+        let root = b.root_path();
+        // (start, end, text) of each path component; offsets keep any prefix (`/` or a drive) intact
+        let mut components: Vec<(usize, usize, &str)> = Vec::new();
+        let mut start = None;
+        for (idx, ch) in root.char_indices().chain(std::iter::once((root.len(), '/'))) {
+            if ch == '/' {
+                if let Some(s) = start.take() {
+                    components.push((s, idx, &root[s..idx]));
+                }
+            } else if start.is_none() {
+                start = Some(idx);
+            }
+        }
+        if let Some(i) = components.iter().rposition(|c| c.2.eq_ignore_ascii_case("Users"))
+            && let Some(&(_, home_end, uname)) = components.get(i + 1) {
+                let home = root[..home_end].to_string();
                 if let Some(u) = b.absolute(&home) {
-                    user_roots.push((u, (*uname).to_string()));
+                    user_roots.push((u, uname.to_string()));
                 } else {
                     for sub in ["Application Support", "Caches", "Containers", "Group Containers", "Logs", "Saved Application State", "HTTPStorages", "WebKit"] {
                         if let Some(c) = b.absolute(&format!("{home}/Library/{sub}")) {
